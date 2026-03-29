@@ -1,0 +1,115 @@
+name: Build & Release Firmware
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'          # Triggers on tags like v1.0.0, v1.2.3, etc.
+  workflow_dispatch:       # Also allows manual runs from the GitHub UI
+
+permissions:
+  contents: write          # Needed to create releases and commit version.json
+
+jobs:
+  build:
+    name: Build with PlatformIO
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Check out source ────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Install Python + PlatformIO ─────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      # ── 3. Cache PlatformIO packages (speeds up builds) ────
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      # ── 4. Build the production firmware ───────────────────
+      - name: Build firmware
+        run: platformio run --environment tsim7000g
+
+      # ── 5. Locate the compiled binary ──────────────────────
+      - name: Find firmware binary
+        id: find_bin
+        run: |
+          BIN=$(find .pio/build/tsim7000g -name "firmware.bin" | head -1)
+          echo "bin_path=$BIN" >> $GITHUB_OUTPUT
+          echo "Found binary: $BIN"
+
+      # ── 6. Extract version from tag (v1.2.3 → 1.2.3) ──────
+      - name: Extract version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Release version: $VERSION"
+
+      # ── 7. Write version.json so devices can check it ──────
+      #    Committed back to main — devices fetch this via raw.githubusercontent.com
+      - name: Write version.json
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${GITHUB_REF_NAME}"
+          BINARY_URL="https://github.com/${OWNER}/${REPO}/releases/download/${TAG}/firmware.bin"
+
+          cat > version.json << EOF
+          {
+            "version": "${VERSION}",
+            "tag": "${TAG}",
+            "binary_url": "${BINARY_URL}",
+            "released_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+
+          echo "version.json contents:"
+          cat version.json
+
+      # ── 8. Commit version.json back to main ────────────────
+      - name: Commit version.json to main
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          git add version.json
+          git diff --cached --quiet || git commit -m "chore: update version.json to ${{ steps.version.outputs.version }} [skip ci]"
+          git push origin main
+
+      # ── 9. Create GitHub Release with firmware.bin ─────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Firmware ${{ steps.version.outputs.version }}"
+          body: |
+            ## Firmware ${{ steps.version.outputs.version }}
+
+            Built automatically from commit ${{ github.sha }}.
+
+            ### Remote OTA
+            Devices on WiFi will detect this release on their next hourly check
+            and self-update. No manual intervention needed.
+
+            ### Manual Flash
+            Download `firmware.bin` below and flash with:
+            ```
+            esptool.py --chip esp32 write_flash 0x10000 firmware.bin
+            ```
+          files: ${{ steps.find_bin.outputs.bin_path }}
+          draft: false
+          prerelease: false
