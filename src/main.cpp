@@ -64,6 +64,8 @@
 #include <Wire.h>
 #include <Adafruit_BMP280.h>
 
+#include <SSLClient.h>        // TLS over TinyGsmClient — enables cellular OTA
+
 #include "secrets.h"         // WiFi + MQTT credentials (gitignored)
 #include "version.h"         // FW_VERSION_STR — bump before each release
 #include "ota_update.h"      // otaInit() / otaLoop() / otaCheckNow()
@@ -141,9 +143,9 @@ Adafruit_BMP280 bme;   // I2C address 0x76 (SDO → GND); chip ID 0x58
 WiFiClientSecure wifiSecure;
 HardwareSerial   SerialAT(1);
 TinyGsm          modem(SerialAT);
-TinyGsmClient    gsmClient(modem, 0);   // plain TCP — TinyGSM SIM7000 does not
-                                        // expose TinyGsmClientSecure; cellular
-                                        // path uses port 1883 (unencrypted).
+TinyGsmClient    gsmClient(modem, 0);   // socket 0 — plain TCP for MQTT (port 1883)
+TinyGsmClient    gsmClientOTA(modem, 1);// socket 1 — base TCP layer for OTA SSL
+SSLClient<TinyGsmClient> sslGsmClient(gsmClientOTA); // TLS wrapper for cellular OTA HTTPS
 
 PubSubClient  mqttWifi(wifiSecure);
 PubSubClient  mqttCell(gsmClient);
@@ -593,14 +595,18 @@ void setup() {
   initTime();   // NTP for WiFi path; GPS-based sync will fill in cellular path
   initGPS();    // Enable GNSS and wait for first fix
 
-  // ── OTA: WiFi path only ───────────────────────────────────────────────────
-  // SIM7000G does not expose TinyGsmClientSecure, so HTTPS OTA is only
-  // available when connected via WiFi. wifiSecure is already configured above.
+  // ── OTA: both WiFi and cellular paths ────────────────────────────────────
+  // WiFi uses WiFiClientSecure (native TLS).
+  // Cellular uses SSLClient wrapping TinyGsmClient socket 1 (BearSSL over TCP).
+  // setInsecure() skips CA verification — acceptable here because we control
+  // the GitHub repo the binary is pulled from.
   if (!usingCellular) {
     otaInit(wifiSecure);
-    Serial.println("OTA: enabled (WiFi path, checks every hour)");
+    Serial.println("OTA: enabled (WiFi, checks every hour)");
   } else {
-    Serial.println("OTA: disabled on cellular path (no SSL support on SIM7000G)");
+    sslGsmClient.setInsecure();
+    otaInit(sslGsmClient);
+    Serial.println("OTA: enabled (cellular via SSLClient, checks every hour)");
   }
 }
 

@@ -4,6 +4,10 @@
 .vscode/launch.json
 .vscode/ipch
 
+# macOS metadata — never commit these
+.DS_Store
+**/.DS_Store
+
 # Credentials — NEVER commit these
 src/secrets.h
 secrets.h
