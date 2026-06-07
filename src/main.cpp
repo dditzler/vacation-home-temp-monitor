@@ -1,47 +1,43 @@
 // ============================================================
 //  Vacation Home Temperature Monitor — T-SIM7000G
 //  Board: LilyGO T-SIM7000G (ESP32 + SIM7000G modem)
+//  Serial: SIM7-0001
+//  Firmware: see version.h
 //
 //  Transport priority:
 //    1. WiFi  → MQTT over TLS (port 8883)
-//    2. Cellular (Hologram) → MQTT over TLS (port 8883)
+//    2. Cellular (Hologram) → MQTT plain TCP (port 1883, temp)
+//       TODO: upgrade to TLS once SSLClient confirmed stable
 //
-//  GPS (built-in SIM7000G GNSS):
-//    - Modem always initialized so GPS works on both WiFi and cellular paths
-//    - Location is only included in a payload when the device has moved
-//      more than MOVE_THRESHOLD_M meters from the last reported position
-//    - While stationary, fixes are averaged using Welford's running mean;
-//      once BASELINE_SAMPLES good fixes accumulate the refined position is
-//      sent once as a one-time accuracy update
+//  Sensor: SHT31-D breakout (Adafruit) via I2C
+//    VCC → 3.3V  |  GND → GND  |  SCL → GPIO22  |  SDA → GPIO21
+//    ADDR pin → GND  (I2C address 0x44)
+//    Provides: temperature (°C, ±0.3°C) + relative humidity (%, ±2%)
 //
-//  Time:
-//    - WiFi path → NTP synced (pool.ntp.org); timezone = US Central with DST
-//    - Cellular path → system clock set from GPS UTC each cycle
-//    - Both paths use the POSIX TZ string "CST6CDT,M3.2.0,M11.1.0" so
-//      localtime_r() always returns the correct Central time automatically
+//  Power outage detection: voltage divider on VBUS → GPIO34 (ADC)
+//    VBUS (5V) → 100kΩ → GPIO34 → 47kΩ → GND
+//    ~1.60V / 1989 ADC counts when mains on; ~0 when off
+//    Publishes to MQTT_POWER_TOPIC on outage and restore events (retained)
+//
+//  Time sync:
+//    WiFi path  → NTP (pool.ntp.org)
+//    Cellular   → NITZ via modem.getNetworkTime() after registration
+//    Both paths use POSIX TZ "CST6CDT,M3.2.0,M11.1.0" for Central time
 //
 //  Daily summary:
-//    - On-device hi/lo tracked across every temperature reading
-//    - Transmitted ONCE at 6:00 PM Central on topic MQTT_DAILY_TOPIC
-//    - Resets at midnight Central; safe to power-cycle mid-day (sends
-//      whatever readings have accumulated when 6 PM arrives)
+//    On-device hi/lo tracked; transmitted once at 6:00 PM Central
+//    on topic MQTT_DAILY_TOPIC. Resets at midnight.
 //
-//  Sensor: BMP280 breakout (GY-BMP280) via I2C
-//    VCC → 3.3V  |  GND → GND  |  SCL → GPIO22  |  SDA → GPIO21
-//    CSB → 3.3V (I2C mode)  |  SDO → GND (address 0x76)
-//  Payload includes temperature (°F or °C) and pressure (hPa).
-//  Note: BMP280 does not have a humidity sensor (use BME280 for humidity).
+//  OTA:
+//    WiFi path  → WiFiClientSecure (native TLS)
+//    Cellular   → SSLClient over TinyGsmClient socket 1
+//    Checks hourly; reboots automatically on new version.
+//    To release: bump version.h, commit, git tag sensor-vX.Y.Z, push.
 //
-//  Data savings: only one temperature unit is transmitted per payload.
-//  Toggle USE_IMPERIAL below — comment it out to switch to Metric.
-//
-//  OTA updates:
-//    - WiFi path only (SIM7000G does not expose TinyGsmClientSecure).
-//    - Device checks GitHub for a new firmware version once per hour.
-//    - To release a new version: bump FW_VERSION_* in version.h,
-//      commit, then: git tag v1.x.x && git push origin v1.x.x
-//    - GitHub Actions builds the binary and updates version.json
-//      automatically; devices detect the new version on next check.
+//  MQTT topics:
+//    vacation/cust1/il/temp/status  — realtime temp+humidity+mains (5 min)
+//    vacation/cust1/il/temp/daily   — hi/lo summary at 6 PM Central
+//    vacation/cust1/il/temp/power   — outage/restore events (retained)
 // ============================================================
 
 // ─── Unit toggle ─────────────────────────────────────────────────────────────
@@ -54,26 +50,34 @@
 #define TINY_GSM_RX_BUFFER 512
 
 #include <Arduino.h>
-#include <math.h>            // sin, cos, atan2, sqrt — Haversine
-#include <time.h>            // time_t, struct tm, mktime, localtime_r
-#include <sys/time.h>        // settimeofday
+#include <time.h>
+#include <sys/time.h>
 #include <TinyGsmClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <Wire.h>
-#include <Adafruit_BMP280.h>
+#if defined(SENSOR_SHT31)
+  #include <Adafruit_SHT31.h>
+#elif defined(SENSOR_BMP280)
+  #include <Adafruit_BMP280.h>
+#else
+  #error "Define SENSOR_SHT31 or SENSOR_BMP280 in build_flags"
+#endif
 
-#include <SSLClient.h>        // TLS over TinyGsmClient — enables cellular OTA
+#include <SSLClient.h>   // TLS over TinyGsmClient for cellular OTA
 
-#include "secrets.h"         // WiFi + MQTT credentials (gitignored)
-#include "version.h"         // FW_VERSION_STR — bump before each release
-#include "ota_update.h"      // otaInit() / otaLoop() / otaCheckNow()
+// ─── OTA config ───────────────────────────────────────────────────────────────
+#ifndef OTA_GITHUB_USER
+  #define OTA_GITHUB_USER  "dditzler"
+#endif
+#ifndef OTA_GITHUB_REPO
+  #define OTA_GITHUB_REPO  "ernie"
+#endif
 
-// ─── OTA config — set to match your GitHub repo ──────────────────────────────
-// These can also be set as -D build flags in platformio.ini instead.
-#define OTA_GITHUB_USER  "dditzler"
-#define OTA_GITHUB_REPO  "vacation-home-temp-monitor"
+#include "secrets.h"    // WiFi + MQTT credentials + OTA_GITHUB_TOKEN (gitignored)
+#include "version.h"    // FW_VERSION_STR — bump before each release
+#include "ota_update.h" // otaInit() / otaLoop()
 
 // ─── WiFi credentials (from secrets.h) ───────────────────────────────────────
 const char* WIFI_NETWORKS[][2] = {
@@ -81,71 +85,76 @@ const char* WIFI_NETWORKS[][2] = {
   { WIFI_SSID_2, WIFI_PASS_2 },   // vacation home
 };
 
-// ─── Cellular — Hologram network ─────────────────────────────────────────────
+// ─── Cellular — Hologram ─────────────────────────────────────────────────────
 const char* CELLULAR_APN = "hologram";
-const char* CELLULAR_PIN = "";           // SIM PIN — leave blank if none
 
-// ─── MQTT broker (HiveMQ Cloud) ──────────────────────────────────────────────
-// Production broker (WiFi path — TLS)
+// ─── MQTT broker ─────────────────────────────────────────────────────────────
 const char* MQTT_HOST        = "ad21434501c84aad995bc5621bf77f15.s1.eu.hivemq.cloud";
 const int   MQTT_PORT_WIFI   = 8883;
 
-// Cellular test broker — HiveMQ public broker, no TLS, no auth required.
-// Confirms the cellular MQTT stack works before we add TLS.
-// TODO: replace with SSLClient-wrapped HiveMQ Cloud once confirmed working.
+// Cellular test broker — plain TCP (TLS pending SSLClient stability confirmation)
 const char* MQTT_HOST_CELL   = "broker.hivemq.com";
 const int   MQTT_PORT_CELL   = 1883;
-const char* MQTT_USER        = MQTT_USER_VAL;   // from secrets.h
-const char* MQTT_PASS        = MQTT_PASS_VAL;   // from secrets.h
-const char* MQTT_TOPIC       = "vacation/cust1/il/temp/status";   // realtime
-const char* MQTT_DAILY_TOPIC = "vacation/cust1/il/temp/daily";    // hi/lo summary
+
+const char* MQTT_USER        = MQTT_USER_VAL;
+const char* MQTT_PASS        = MQTT_PASS_VAL;
+const char* MQTT_TOPIC       = "vacation/cust1/il/temp/status";
+const char* MQTT_DAILY_TOPIC = "vacation/cust1/il/temp/daily";
+const char* MQTT_POWER_TOPIC = "vacation/cust1/il/temp/power";  // retained
 
 // ─── Hardware pin assignments ─────────────────────────────────────────────────
-// BME280 uses I2C — SDA=GPIO21, SCL=GPIO22 (ESP32 defaults, no pin defines needed)
 #define MODEM_TX      27
 #define MODEM_RX      26
 #define MODEM_PWRKEY   4
 #define MODEM_DTR     25
 
-// ─── Timing ──────────────────────────────────────────────────────────────────
-// PUBLISH_INTERVAL can be overridden per-environment via a -D build flag
-// (e.g. tsim7000g_test sets it to 10000UL for faster feedback).
-#ifndef PUBLISH_INTERVAL
-#define PUBLISH_INTERVAL  300000UL   // ms between realtime publishes (5 minutes on cellular)
-#endif
-#define WIFI_TIMEOUT_MS    30000UL   // ms to try WiFi before cellular fallback
+// Voltage divider: VBUS (5V) → 100kΩ → GPIO34 → 47kΩ → GND
+// GPIO34 is ADC1_CH6 (input-only — no boot conflict)
+#define POWER_ADC_PIN       34
+#define POWER_ON_THRESH     1000    // raw 12-bit counts; ~1989 normal, ~0 when off
+#define POWER_DEBOUNCE_MS   3000UL  // 3 s debounce before declaring a state change
 
-// ─── GPS tuning ──────────────────────────────────────────────────────────────
-#define MOVE_THRESHOLD_M   50.0      // meters; less than this = stationary
-#define BASELINE_SAMPLES   20        // fixes to Welford-average for refined pos
-#define GPS_HDOP_MAX        5.0      // reject fixes with HDOP above this (loosened for faster first fix)
-#define GPS_INITIAL_WAIT_S 120       // seconds to wait for first fix at startup
+// Sensor I2C addresses
+#if defined(SENSOR_SHT31)
+  #define SHT31_ADDR  0x44   // ADDR pin → GND
+#elif defined(SENSOR_BMP280)
+  #define BMP280_ADDR 0x76   // SDO pin → GND
+#endif
+
+// ─── Timing ──────────────────────────────────────────────────────────────────
+#ifndef PUBLISH_INTERVAL
+#define PUBLISH_INTERVAL  300000UL   // 5 minutes on cellular
+#endif
+#define WIFI_TIMEOUT_MS    30000UL
 
 // ─── Time zone ───────────────────────────────────────────────────────────────
-// POSIX TZ string: US Central Standard/Daylight — handles DST automatically
 #define TZ_CENTRAL "CST6CDT,M3.2.0,M11.1.0"
 
 // ─── Temperature offset (self-heating correction) ────────────────────────────
-// BMP280 reads high when mounted near the ESP32/modem heat source.
-// Tune this value by comparing against a known-good thermometer.
-// Set to 0.0f to disable once the sensor is physically separated from the board.
-#define TEMP_OFFSET_F  -8.0f
+// Self-heating correction — tune by comparing against a reference thermometer.
+// BMP280 runs hotter (modem heat path); SHT31-D is slightly better isolated.
+#if defined(SENSOR_BMP280)
+  #define TEMP_OFFSET_F  -8.0f
+#else
+  #define TEMP_OFFSET_F  -4.0f
+#endif
 
-// ─── Sensor ──────────────────────────────────────────────────────────────────
-// STUB_TEMP: defined by the tsim7000g_test build environment.
-// When set, sensor hardware is skipped entirely and fixed values are injected
-// so the modem / GPS / network / MQTT stack can be tested without wiring.
+// ─── Sensor object ───────────────────────────────────────────────────────────
 #ifndef STUB_TEMP
-Adafruit_BMP280 bme;   // I2C address 0x76 (SDO → GND); chip ID 0x58
+  #if defined(SENSOR_SHT31)
+    Adafruit_SHT31    sht31;
+  #elif defined(SENSOR_BMP280)
+    Adafruit_BMP280   bmp280;
+  #endif
 #endif
 
 // ─── Transport objects ────────────────────────────────────────────────────────
 WiFiClientSecure wifiSecure;
 HardwareSerial   SerialAT(1);
 TinyGsm          modem(SerialAT);
-TinyGsmClient    gsmClient(modem, 0);   // socket 0 — plain TCP for MQTT (port 1883)
-TinyGsmClient    gsmClientOTA(modem, 1);// socket 1 — base TCP layer for OTA SSL
-SSLClient<TinyGsmClient> sslGsmClient(gsmClientOTA); // TLS wrapper for cellular OTA HTTPS
+TinyGsmClient    gsmClient(modem, 0);     // socket 0 — MQTT plain TCP
+TinyGsmClient    gsmClientOTA(modem, 1);  // socket 1 — base TCP for OTA TLS
+SSLClient        sslGsmClient(&gsmClientOTA);
 
 PubSubClient  mqttWifi(wifiSecure);
 PubSubClient  mqttCell(gsmClient);
@@ -156,263 +165,131 @@ unsigned long lastPublish   = 0;
 String        deviceId;
 
 // ─── Time state ──────────────────────────────────────────────────────────────
-bool timeSynced = false;   // true once NTP or GPS-UTC has set the system clock
-
-// ─── GPS state ────────────────────────────────────────────────────────────────
-double  baselineLat   = 0.0, baselineLon  = 0.0;
-int     baselineCount = 0;
-bool    baselineSent  = false;
-
-double  lastSentLat   = 0.0, lastSentLon = 0.0;
-bool    lastSentValid = false;
-
-bool    locPending = false;
-double  pendingLat = 0.0, pendingLon = 0.0;
-
-// Last GPS UTC time (updated by readGpsFix on every successful call)
-bool  gpsTimeValid = false;
-int   gpsYear = 0, gpsMonth = 0, gpsDay = 0;
-int   gpsHour = 0, gpsMin   = 0, gpsSec = 0;
-
-// Last known satellite counts (updated every GPS query, fix or not)
-int   gpsVisibleSats = 0, gpsUsedSats = 0;
+bool timeSynced = false;
 
 // ─── Daily hi/lo state ───────────────────────────────────────────────────────
-float dailyHi       = -999.0f;  // sentinel = no reading yet this day
+float dailyHi       = -999.0f;
 float dailyLo       =  999.0f;
-int   dailyReadings = 0;         // readings accumulated since last midnight reset
-bool  dailySent     = false;     // true once today's 6pm summary has been sent
-int   lastDay       = -1;        // day-of-month at last midnight-check (local time)
+int   dailyReadings = 0;
+bool  dailySent     = false;
+int   lastDay       = -1;
 
-// ─── Haversine distance (meters) ─────────────────────────────────────────────
-double haversineM(double lat1, double lon1, double lat2, double lon2) {
-  const double R = 6371000.0;
-  double dLat = (lat2 - lat1) * DEG_TO_RAD;
-  double dLon = (lon2 - lon1) * DEG_TO_RAD;
-  double a    = sin(dLat / 2) * sin(dLat / 2)
-              + cos(lat1 * DEG_TO_RAD) * cos(lat2 * DEG_TO_RAD)
-              * sin(dLon / 2) * sin(dLon / 2);
-  return R * 2.0 * atan2(sqrt(a), sqrt(1.0 - a));
-}
-
-// ─── GPS time → system clock (cellular path only) ────────────────────────────
-// Called after each successful GPS fix.  Temporarily sets TZ=UTC so mktime()
-// interprets the GPS UTC fields correctly, converts to epoch, then restores
-// Central time and calls settimeofday().
-void syncTimeFromGPS() {
-  if (!gpsTimeValid) return;
-
-  setenv("TZ", "UTC0", 1);
-  tzset();
-
-  struct tm t = {};
-  t.tm_year  = gpsYear  - 1900;
-  t.tm_mon   = gpsMonth - 1;
-  t.tm_mday  = gpsDay;
-  t.tm_hour  = gpsHour;
-  t.tm_min   = gpsMin;
-  t.tm_sec   = gpsSec;
-  t.tm_isdst = 0;
-  time_t epoch = mktime(&t);
-
-  setenv("TZ", TZ_CENTRAL, 1);   // restore Central before any time ops
-  tzset();
-
-  struct timeval tv = { epoch, 0 };
-  settimeofday(&tv, nullptr);
-  timeSynced = true;
-}
-
-// ─── Read one GPS fix ─────────────────────────────────────────────────────────
-// Always stores the raw UTC time fields in globals (used for clock sync).
-// Returns true only if position quality passes the HDOP threshold.
-bool readGpsFix(double& lat, double& lon, float& hdop) {
-  float fLat, fLon, speed, alt, accuracy;
-  int   vsat, usat, year, month, day, hour, minute, sec;
-
-  if (!modem.getGPS(&fLat, &fLon, &speed, &alt,
-                    &vsat, &usat, &accuracy,
-                    &year, &month, &day, &hour, &minute, &sec)) {
-    return false;
-  }
-
-  // Always update satellite counts so "no fix" messages can report them
-  gpsVisibleSats = vsat;
-  gpsUsedSats    = usat;
-
-  // Store GPS UTC time regardless of positional quality; used for clock sync
-  if (year > 2020) {
-    gpsYear = year; gpsMonth = month; gpsDay = day;
-    gpsHour = hour; gpsMin   = minute; gpsSec = sec;
-    gpsTimeValid = true;
-    if (usingCellular) syncTimeFromGPS();   // keep system clock aligned to GPS
-  }
-
-  if (fLat == 0.0f && fLon == 0.0f) return false;
-  if (accuracy > GPS_HDOP_MAX)       return false;
-
-  lat  = static_cast<double>(fLat);
-  lon  = static_cast<double>(fLon);
-  hdop = accuracy;
-  return true;
-}
-
-// ─── GPS initialisation ───────────────────────────────────────────────────────
-void initGPS() {
-  // GPS was already enabled early in setup() to start acquiring sats during
-  // network connection. Just wait here for the first fix.
-  Serial.println("Waiting for GPS fix (already acquiring)...");
-
-  Serial.printf("Waiting up to %d s for initial GPS fix", GPS_INITIAL_WAIT_S);
-  unsigned long deadline = millis() + GPS_INITIAL_WAIT_S * 1000UL;
-
-  while (millis() < deadline) {
-    double lat, lon;
-    float  hdop;
-    if (readGpsFix(lat, lon, hdop)) {
-      Serial.printf("\nGPS fix: %.5f, %.5f  HDOP: %.1f\n", lat, lon, hdop);
-      lastSentLat   = lat;  lastSentLon   = lon;  lastSentValid = true;
-      baselineLat   = lat;  baselineLon   = lon;  baselineCount = 1;
-      pendingLat    = lat;  pendingLon    = lon;  locPending    = true;
-      return;
-    }
-    // Even without a position fix, readGpsFix may have synced the clock
-    delay(2000);
-    Serial.print(".");
-  }
-  Serial.println("\nGPS: no position fix yet — will retry each publish cycle.");
-}
-
-// ─── GPS update (called each publish cycle) ───────────────────────────────────
-bool updateGPS() {
-  double lat, lon;
-  float  hdop;
-
-  if (!readGpsFix(lat, lon, hdop)) {
-    Serial.printf("GPS: no fix  (sats visible: %d, used: %d)\n",
-                  gpsVisibleSats, gpsUsedSats);
-    return false;
-  }
-
-  if (!lastSentValid) {
-    Serial.printf("GPS: first fix %.5f, %.5f  HDOP %.1f\n", lat, lon, hdop);
-    lastSentLat = lat;  lastSentLon = lon;  lastSentValid = true;
-    baselineLat = lat;  baselineLon = lon;  baselineCount = 1;
-    pendingLat  = lat;  pendingLon  = lon;
-    return true;
-  }
-
-  double distMoved = haversineM(lastSentLat, lastSentLon, lat, lon);
-
-  if (distMoved >= MOVE_THRESHOLD_M) {
-    Serial.printf("GPS: moved %.1f m — updating position\n", distMoved);
-    lastSentLat   = lat;  lastSentLon   = lon;
-    baselineLat   = lat;  baselineLon   = lon;
-    baselineCount = 1;    baselineSent  = false;
-    pendingLat    = lat;  pendingLon    = lon;
-    return true;
-  }
-
-  // Stationary — accumulate Welford running mean (reject scatter > threshold/2)
-  double driftFromBase = haversineM(baselineLat, baselineLon, lat, lon);
-  if (driftFromBase < MOVE_THRESHOLD_M / 2.0) {
-    baselineCount++;
-    baselineLat += (lat - baselineLat) / static_cast<double>(baselineCount);
-    baselineLon += (lon - baselineLon) / static_cast<double>(baselineCount);
-    Serial.printf("GPS: sample %d/%d  avg=(%.5f, %.5f)\n",
-                  baselineCount, BASELINE_SAMPLES, baselineLat, baselineLon);
-  }
-
-  if (baselineCount >= BASELINE_SAMPLES && !baselineSent) {
-    Serial.printf("GPS: baseline ready (n=%d) → refined pos (%.5f, %.5f)\n",
-                  baselineCount, baselineLat, baselineLon);
-    baselineSent  = true;
-    lastSentLat   = baselineLat;  lastSentLon  = baselineLon;
-    pendingLat    = baselineLat;  pendingLon   = baselineLon;
-    return true;
-  }
-
-  return false;
-}
+// ─── Power outage detection state ────────────────────────────────────────────
+bool          mainsPresent     = true;
+unsigned long powerEdgeMs      = 0;
+bool          powerEdgePending = false;
+unsigned long outageStartMs    = 0;
 
 // ─── Daily hi/lo tracking & 6pm summary ──────────────────────────────────────
-// Call every publish cycle with the freshly-read temperature.
 void checkDailySummary(float temp) {
-
-  // On WiFi, NTP syncs asynchronously — check whether the clock is valid yet
   if (!timeSynced && !usingCellular) {
-    time_t now = time(nullptr);
-    if (now > 1000000000UL) timeSynced = true;   // epoch > ~2001: clock is set
+    if (time(nullptr) > 1000000000UL) timeSynced = true;
   }
-  if (!timeSynced) return;   // no time reference yet — skip until we have one
+  if (!timeSynced) return;
 
-  // ── Update hi/lo with this reading ──────────────────────────────────────
   if (temp > dailyHi) dailyHi = temp;
   if (temp < dailyLo) dailyLo = temp;
   dailyReadings++;
 
-  // ── Get current Central time ─────────────────────────────────────────────
   time_t    now = time(nullptr);
   struct tm ct;
-  localtime_r(&now, &ct);     // ct is now in US Central (DST-aware via TZ env)
+  localtime_r(&now, &ct);
 
-  // ── Midnight rollover — new day, reset accumulators ──────────────────────
   if (lastDay != -1 && ct.tm_mday != lastDay) {
     Serial.printf("Daily reset: %02d→%02d\n", lastDay, ct.tm_mday);
-    dailyHi = temp;  dailyLo = temp;  dailyReadings = 1;  dailySent = false;
+    dailyHi = temp; dailyLo = temp; dailyReadings = 1; dailySent = false;
   }
   lastDay = ct.tm_mday;
 
-  // ── 6 PM Central — publish today's hi/lo (once per day) ─────────────────
-  // Uses >= 18 so a missed cycle during reconnect can't skip the send entirely.
   if (ct.tm_hour >= 18 && !dailySent && dailyReadings >= 1) {
     char dateBuf[12];
     strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", &ct);
 
-    char payload[160];
+    char payload[200];
 #ifdef USE_IMPERIAL
     snprintf(payload, sizeof(payload),
-      "{\"customerId\":\"cust1\",\"houseId\":\"il\",\"mode\":\"daily\","
+      "{\"sn\":\"SIM7-0001\",\"mode\":\"daily\","
       "\"date\":\"%s\",\"hi_f\":%.1f,\"lo_f\":%.1f}",
       dateBuf, dailyHi, dailyLo);
 #else
     snprintf(payload, sizeof(payload),
-      "{\"customerId\":\"cust1\",\"houseId\":\"il\",\"mode\":\"daily\","
+      "{\"sn\":\"SIM7-0001\",\"mode\":\"daily\","
       "\"date\":\"%s\",\"hi_c\":%.1f,\"lo_c\":%.1f}",
       dateBuf, dailyHi, dailyLo);
 #endif
-
     Serial.printf("[%s] Daily: %s\n", usingCellular ? "CELL" : "WiFi", payload);
-    if (mqtt->publish(MQTT_DAILY_TOPIC, payload, true)) {   // retain=true: broker holds last daily for fresh dashboard loads
-      dailySent = true;
-    }
-    // If publish returns false (e.g. broker dropped), dailySent stays false
-    // and the next cycle will retry until it succeeds.
+    if (mqtt->publish(MQTT_DAILY_TOPIC, payload, true)) dailySent = true;
+  }
+}
+
+// ─── Power outage detection ───────────────────────────────────────────────────
+//
+//  Debounces ADC transitions. Publishes retained events on MQTT_POWER_TOPIC.
+//
+//  Outage payload:  {"sn":"SIM7-0001","event":"outage","adc":<n>,"fw":"<ver>"}
+//  Restore payload: {"sn":"SIM7-0001","event":"restore","outage_s":<n>,"adc":<n>,"fw":"<ver>"}
+//
+//  During an actual outage the ESP32 loses USB power — no MQTT possible.
+//  The restore event (with outage_s duration) is sent as soon as the device
+//  reboots and reconnects.
+//
+void checkPower() {
+  int  raw      = analogRead(POWER_ADC_PIN);
+  bool mainsNow = (raw >= POWER_ON_THRESH);
+
+  if (mainsNow == mainsPresent) {
+    powerEdgePending = false;
+    return;
+  }
+
+  if (!powerEdgePending) {
+    powerEdgePending = true;
+    powerEdgeMs      = millis();
+    Serial.printf("[POWER] ADC=%d — possible %s, debouncing...\n",
+                  raw, mainsNow ? "RESTORE" : "OUTAGE");
+    return;
+  }
+
+  if (millis() - powerEdgeMs < POWER_DEBOUNCE_MS) return;
+
+  // Debounce complete — commit the state change
+  powerEdgePending = false;
+  mainsPresent     = mainsNow;
+
+  char payload[180];
+  if (!mainsPresent) {
+    outageStartMs = millis();
+    snprintf(payload, sizeof(payload),
+      "{\"sn\":\"SIM7-0001\",\"event\":\"outage\",\"adc\":%d,\"fw\":\"%s\"}",
+      raw, FW_VERSION_STR);
+    Serial.printf("[POWER] *** MAINS LOST *** ADC=%d\n", raw);
+  } else {
+    uint32_t outageSec = (millis() - outageStartMs) / 1000;
+    snprintf(payload, sizeof(payload),
+      "{\"sn\":\"SIM7-0001\",\"event\":\"restore\",\"outage_s\":%lu,\"adc\":%d,\"fw\":\"%s\"}",
+      outageSec, raw, FW_VERSION_STR);
+    Serial.printf("[POWER] Mains restored after %lu s, ADC=%d\n", outageSec, raw);
+  }
+
+  if (mqtt && mqtt->connected()) {
+    mqtt->publish(MQTT_POWER_TOPIC, payload, true);  // retained
   }
 }
 
 // ─── Modem power-on and initialisation ───────────────────────────────────────
 bool initModem() {
   Serial.println("Powering on SIM7000G...");
-
-  // LilyGO T-SIM7000G PWRKEY sequence (per official LilyGO reference examples):
-  // Drive HIGH ≥ 100 ms, then release LOW — SIM7000G boots in ~5 s.
-  // (Earlier code had the polarity reversed which prevented boot.)
   pinMode(MODEM_PWRKEY, OUTPUT);
   digitalWrite(MODEM_PWRKEY, HIGH);
   delay(300);
   digitalWrite(MODEM_PWRKEY, LOW);
 
-  // DTR LOW keeps the modem awake and prevents it entering sleep mode
   pinMode(MODEM_DTR, OUTPUT);
   digitalWrite(MODEM_DTR, LOW);
 
   SerialAT.begin(9600, SERIAL_8N1, MODEM_RX, MODEM_TX);
   delay(100);
 
-  // Poll for AT response — modem typically responds within 5-8 s of power-on.
-  // Using testAT() rather than a fixed delay makes this robust across
-  // board revisions and cold vs. warm boot conditions.
   Serial.print("Waiting for modem");
   bool modemUp = false;
   for (int i = 0; i < 15; i++) {
@@ -422,110 +299,119 @@ bool initModem() {
   }
   Serial.println();
 
-  if (!modemUp) {
-    Serial.println("ERROR: Modem not responding after 15 s.");
-    return false;
-  }
-
-  // Modem is alive — init() configures without forcing a hardware reset
-  // (restart() is for when the modem is already running; here we just powered it on)
-  if (!modem.init()) {
-    Serial.println("ERROR: Modem init() failed.");
-    return false;
-  }
+  if (!modemUp) { Serial.println("ERROR: Modem not responding."); return false; }
+  if (!modem.init()) { Serial.println("ERROR: Modem init() failed."); return false; }
 
   Serial.printf("Modem: %s\n", modem.getModemInfo().c_str());
   return true;
 }
 
-// ─── Cellular data connect (modem already initialised) ───────────────────────
+// ─── Cellular data connect ───────────────────────────────────────────────────
 bool connectCellular() {
-  modem.sendAT(GF("+CNMP=38"));   // LTE only
+  modem.sendAT(GF("+CNMP=38"));  // LTE only
   modem.waitResponse(10000L);
-  modem.sendAT(GF("+CMNB=3"));    // Cat-M + NB-IoT
+  modem.sendAT(GF("+CMNB=3"));   // Cat-M + NB-IoT
   modem.waitResponse(10000L);
 
   Serial.printf("Connecting to Hologram APN: %s\n", CELLULAR_APN);
   if (!modem.gprsConnect(CELLULAR_APN, "", "")) {
-    Serial.println("ERROR: Cellular connect failed.");
-    return false;
+    Serial.println("ERROR: Cellular connect failed."); return false;
   }
-  Serial.printf("Cellular connected. IP: %s\n", modem.localIP().toString().c_str());
+  Serial.printf("Cellular IP: %s\n", modem.localIP().toString().c_str());
   return true;
+}
+
+// ─── NITZ time sync (cellular path) ─────────────────────────────────────────
+// SIM7000G provides network time via AT+CCLK? after registration.
+// Falls back gracefully if NITZ is unavailable on this operator.
+void syncTimeFromNITZ() {
+  // TinyGSM getNetworkTime() now requires 7 out-params instead of returning String.
+  int yy, mo, dd, hh, mm, ss;
+  float tz_f;
+  if (!modem.getNetworkTime(&yy, &mo, &dd, &hh, &mm, &ss, &tz_f)) {
+    Serial.println("[NITZ] No time from network — clock not yet synced.");
+    return;
+  }
+  // tz_f is in quarter-hours (e.g. -24.0 = UTC-6). Convert to seconds.
+  int tzOffsetSec = (int)(tz_f * 15.0f * 60.0f);
+
+  setenv("TZ", "UTC0", 1); tzset();
+  struct tm t = {};
+  t.tm_year  = 2000 + yy - 1900;
+  t.tm_mon   = mo - 1;
+  t.tm_mday  = dd;
+  t.tm_hour  = hh;
+  t.tm_min   = mm;
+  t.tm_sec   = ss;
+  t.tm_isdst = 0;
+  time_t epoch = mktime(&t) - tzOffsetSec;  // shift to UTC
+
+  setenv("TZ", TZ_CENTRAL, 1); tzset();
+  struct timeval tv = { epoch, 0 };
+  settimeofday(&tv, nullptr);
+  timeSynced = true;
+
+  struct tm ct;
+  localtime_r(&epoch, &ct);
+  char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ct);
+  Serial.printf("[NITZ] Synced: %s Central (tz_offset=%.2f qhr)\n", buf, tz_f);
 }
 
 // ─── WiFi connect ────────────────────────────────────────────────────────────
 bool connectWiFi() {
 #ifdef FORCE_CELLULAR
-  Serial.println("WiFi skipped (FORCE_CELLULAR build flag set).");
+  Serial.println("WiFi skipped (FORCE_CELLULAR).");
   return false;
 #endif
   int count = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
   unsigned long start = millis();
-
   for (int i = 0; i < count; i++) {
-    Serial.printf("Trying WiFi SSID: %s\n", WIFI_NETWORKS[i][0]);
+    Serial.printf("Trying WiFi: %s\n", WIFI_NETWORKS[i][0]);
     WiFi.begin(WIFI_NETWORKS[i][0], WIFI_NETWORKS[i][1]);
-
     while (WiFi.status() != WL_CONNECTED && (millis() - start) < WIFI_TIMEOUT_MS) {
-      delay(500);
-      Serial.print(".");
+      delay(500); Serial.print(".");
     }
     Serial.println();
-
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.printf("WiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
+      Serial.printf("WiFi OK. IP: %s\n", WiFi.localIP().toString().c_str());
       return true;
     }
-    Serial.println("Failed, trying next...");
     WiFi.disconnect();
   }
-  Serial.println("No WiFi network reachable.");
+  Serial.println("No WiFi reachable.");
   return false;
 }
 
 // ─── Time initialisation ─────────────────────────────────────────────────────
 void initTime() {
-  // Set timezone first — affects all subsequent localtime_r() calls
-  setenv("TZ", TZ_CENTRAL, 1);
-  tzset();
-
+  setenv("TZ", TZ_CENTRAL, 1); tzset();
   if (!usingCellular) {
-    // WiFi path: kick off NTP sync (async; timeSynced checked in loop)
-    Serial.println("Starting NTP sync (pool.ntp.org)...");
+    Serial.println("NTP sync (pool.ntp.org)...");
     configTime(0, 0, "pool.ntp.org", "time.google.com");
-
-    // Block briefly to see if NTP responds quickly (good WiFi = usually < 2s)
     struct tm t;
     if (getLocalTime(&t, 8000)) {
-      char buf[32];
-      strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
+      char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &t);
       Serial.printf("NTP synced: %s Central\n", buf);
       timeSynced = true;
     } else {
-      Serial.println("NTP not yet available — will retry in background.");
-      // configTime keeps retrying; loop() checks epoch value each cycle
+      Serial.println("NTP not yet available — will resolve in background.");
     }
+  } else {
+    syncTimeFromNITZ();
   }
-  // Cellular path: clock will be set from GPS UTC via syncTimeFromGPS()
 }
 
-// ─── MQTT connect/reconnect ───────────────────────────────────────────────────
+// ─── MQTT connect ─────────────────────────────────────────────────────────────
 void connectMQTT() {
-  // WiFi  → HiveMQ Cloud TLS port 8883
-  // Cell  → HiveMQ public broker plain TCP port 1883 (temporary test)
   mqtt->setServer(usingCellular ? MQTT_HOST_CELL : MQTT_HOST,
                   usingCellular ? MQTT_PORT_CELL : MQTT_PORT_WIFI);
-  // Cellular: 5-minute keepalive to minimise Hologram data charges.
-  // WiFi: 60-second keepalive for faster broker disconnect detection.
   mqtt->setKeepAlive(usingCellular ? 300 : 60);
-
   while (!mqtt->connected()) {
-    Serial.printf("Connecting to MQTT [%s]...", usingCellular ? "CELL" : "WiFi");
+    Serial.printf("Connecting MQTT [%s]...", usingCellular ? "CELL" : "WiFi");
     if (mqtt->connect(deviceId.c_str(), MQTT_USER, MQTT_PASS)) {
       Serial.println(" OK");
     } else {
-      Serial.printf(" failed rc=%d — retry in 5s\n", mqtt->state());
+      Serial.printf(" rc=%d — retry 5s\n", mqtt->state());
       delay(5000);
     }
   }
@@ -535,78 +421,98 @@ void connectMQTT() {
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== Vacation Home Temperature Monitor — T-SIM7000G ===");
-  Serial.println("Firmware: " FW_VERSION_STR);
+  Serial.printf("\n=== SteadyState Hub SIM7-0001 — T-SIM7000G  fw=%s ===\n", FW_VERSION_STR);
 
-#ifdef USE_IMPERIAL
-  Serial.println("Unit mode: Imperial (°F)");
-#else
-  Serial.println("Unit mode: Metric (°C)");
-#endif
+  // ── ADC: VBUS voltage divider for power outage detection ─────────────────
+  pinMode(POWER_ADC_PIN, INPUT);
+  analogSetPinAttenuation(POWER_ADC_PIN, ADC_11db);  // 0–3.3V range
+  int bootAdc = analogRead(POWER_ADC_PIN);
+  mainsPresent = (bootAdc >= POWER_ON_THRESH);
+  Serial.printf("Power ADC GPIO%d: raw=%d  mains=%s\n",
+                POWER_ADC_PIN, bootAdc, mainsPresent ? "PRESENT" : "ABSENT");
 
+  // ── Temp/humidity sensor init ─────────────────────────────────────────────
 #ifdef STUB_TEMP
-  Serial.printf("BMP280: STUB MODE — injecting %.1f°F, no sensor required\n",
-                (float)STUB_TEMP);
-#else
-  Wire.begin();   // SDA=GPIO21, SCL=GPIO22 (ESP32 defaults)
-  uint8_t bmpAddr = 0;
-  if      (bme.begin(0x76)) { bmpAddr = 0x76; }
-  else if (bme.begin(0x77)) { bmpAddr = 0x77; }
-  else {
-    Serial.println("FATAL: BMP280 not found at 0x76 or 0x77 — check wiring.");
-    Serial.println("  VCC→3.3V  GND→GND  SCL→GPIO22  SDA→GPIO21");
-    while (true) { delay(10000); }
+  Serial.printf("[SENSOR] STUB MODE — injecting %.1f°F, 45.0%%RH\n", (float)STUB_TEMP);
+#elif defined(SENSOR_SHT31)
+  Wire.begin();  // SDA=GPIO21, SCL=GPIO22
+  if (!sht31.begin(SHT31_ADDR)) {
+    Serial.printf("FATAL: SHT31-D not found at 0x%02X — check wiring.\n", SHT31_ADDR);
+    Serial.println("  VCC→3.3V  GND→GND  SCL→GPIO22  SDA→GPIO21  ADDR→GND");
+    while (true) delay(10000);
   }
-  Serial.printf("BMP280 ready (I2C 0x%02X) — temp + pressure only\n", bmpAddr);
+  Serial.printf("[SENSOR] SHT31-D ready (I2C 0x%02X)\n", SHT31_ADDR);
+  float testTemp = sht31.readTemperature();
+  float testHum  = sht31.readHumidity();
+  if (!isnan(testTemp) && !isnan(testHum))
+    Serial.printf("[SENSOR] Boot read: %.1f°C  %.1f%%RH\n", testTemp, testHum);
+  else
+    Serial.println("[SENSOR] WARNING: SHT31-D boot read returned NaN.");
+#elif defined(SENSOR_BMP280)
+  Wire.begin();  // SDA=GPIO21, SCL=GPIO22
+  if (!bmp280.begin(BMP280_ADDR)) {
+    Serial.println("FATAL: BMP280 not found at 0x76 — check wiring.");
+    Serial.println("  VCC→3.3V  GND→GND  SCL→GPIO22  SDA→GPIO21");
+    while (true) delay(10000);
+  }
+  bmp280.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                     Adafruit_BMP280::SAMPLING_X2,   // temp
+                     Adafruit_BMP280::SAMPLING_X16,  // pressure
+                     Adafruit_BMP280::FILTER_X16,
+                     Adafruit_BMP280::STANDBY_MS_500);
+  Serial.println("[SENSOR] BMP280 ready (I2C 0x76) — temp only (no humidity)");
+  Serial.printf("[SENSOR] Boot read: %.1f°C\n", bmp280.readTemperature());
 #endif
 
-  // Modem always needed — GPS requires it even on the WiFi data path
+  // ── Modem ────────────────────────────────────────────────────────────────
   if (!initModem()) {
-    Serial.println("FATAL: Modem did not start. Halting.");
-    while (true) { delay(10000); }
+    Serial.println("FATAL: Modem did not start."); while (true) delay(10000);
   }
 
-  // Start GPS immediately after modem init so it acquires satellites
-  // in parallel while the network connection is being established.
-  // This can save 30-60 seconds of TTFF on a cold start.
-  Serial.println("Starting GPS early (acquiring sats during network connect)...");
-  modem.enableGPS();
-
-  // Data transport
+  // ── Network ──────────────────────────────────────────────────────────────
   if (connectWiFi()) {
     wifiSecure.setInsecure();
     mqtt          = &mqttWifi;
     usingCellular = false;
-    deviceId      = "tsim-wifi-" + WiFi.macAddress();
+    deviceId      = "ssHub001-wifi-" + WiFi.macAddress();
     Serial.println("Transport: WiFi");
   } else {
     WiFi.mode(WIFI_OFF);
     if (!connectCellular()) {
-      Serial.println("FATAL: No network available. Halting.");
-      while (true) { delay(10000); }
+      Serial.println("FATAL: No network available."); while (true) delay(10000);
     }
     mqtt          = &mqttCell;
     usingCellular = true;
-    deviceId      = "tsim-cell-" + modem.getIMEI();
+    deviceId      = "ssHub001-cell-" + modem.getIMEI();
     Serial.println("Transport: Cellular (Hologram)");
   }
 
   connectMQTT();
-  initTime();   // NTP for WiFi path; GPS-based sync will fill in cellular path
-  initGPS();    // Enable GNSS and wait for first fix
+  initTime();
 
-  // ── OTA: both WiFi and cellular paths ────────────────────────────────────
-  // WiFi uses WiFiClientSecure (native TLS).
-  // Cellular uses SSLClient wrapping TinyGsmClient socket 1 (BearSSL over TCP).
-  // setInsecure() skips CA verification — acceptable here because we control
-  // the GitHub repo the binary is pulled from.
+  // ── OTA ──────────────────────────────────────────────────────────────────
   if (!usingCellular) {
     otaInit(wifiSecure);
-    Serial.println("OTA: enabled (WiFi, checks every hour)");
+    Serial.println("OTA: WiFi (checks hourly)");
   } else {
     sslGsmClient.setInsecure();
     otaInit(sslGsmClient);
-    Serial.println("OTA: enabled (cellular via SSLClient, checks every hour)");
+    Serial.println("OTA: Cellular via SSLClient (checks hourly)");
+  }
+
+  // ── Publish restore event if this boot follows a power outage ────────────
+  // If mains is present at boot but the device just rebooted, there may have
+  // been an outage. We publish a one-time restore message with outage_s=0
+  // (duration unknown — reboot cleared the timer). A backend heartbeat gap
+  // can correlate the exact duration from the last seen message timestamp.
+  if (mainsPresent) {
+    char payload[180];
+    snprintf(payload, sizeof(payload),
+      "{\"sn\":\"SIM7-0001\",\"event\":\"restore\",\"outage_s\":0,"
+      "\"adc\":%d,\"fw\":\"%s\",\"note\":\"boot\"}",
+      bootAdc, FW_VERSION_STR);
+    mqtt->publish(MQTT_POWER_TOPIC, payload, true);
+    Serial.println("[POWER] Published boot-restore event.");
   }
 }
 
@@ -614,60 +520,75 @@ void setup() {
 void loop() {
   if (!mqtt->connected()) connectMQTT();
   mqtt->loop();
-
-  // ── OTA check (WiFi only, rate-limited to OTA_CHECK_INTERVAL_S) ──────────
-  // Device will reboot automatically if a new firmware version is downloaded.
-  if (!usingCellular) {
-    otaLoop();
-  }
+  otaLoop();
+  checkPower();  // ADC poll + debounce — publishes on mains state change
 
   unsigned long now = millis();
   if (now - lastPublish < PUBLISH_INTERVAL) return;
   lastPublish = now;
 
-  // ── Temperature, Humidity, Pressure ─────────────────────────────────────
+  // ── Read sensor ──────────────────────────────────────────────────────────
 #ifdef STUB_TEMP
-  // Test mode: no sensor needed — stub values set by build flag
-  float       temp    = (float)STUB_TEMP;
-  const char* tempKey = "temp_f";
-#else
-  float tempC = bme.readTemperature();   // always °C from sensor
-
-  if (isnan(tempC)) {
-    Serial.println("ERROR: BMP280 read failed — check wiring.");
+  float tempF = (float)STUB_TEMP;
+  float rh    = 45.0f;
+  bool  hasRH = true;
+#elif defined(SENSOR_SHT31)
+  float tempC = sht31.readTemperature();
+  float rh    = sht31.readHumidity();
+  bool  hasRH = true;
+  if (isnan(tempC) || isnan(rh)) {
+    Serial.println("ERROR: SHT31-D read failed — skipping publish.");
     return;
   }
-
 #  ifdef USE_IMPERIAL
-  float       temp    = tempC * 9.0f / 5.0f + 32.0f + TEMP_OFFSET_F;
-  const char* tempKey = "temp_f";
+  float tempF = tempC * 9.0f / 5.0f + 32.0f + TEMP_OFFSET_F;
 #  else
-  float       temp    = tempC + (TEMP_OFFSET_F * 5.0f / 9.0f);  // convert offset to °C
-  const char* tempKey = "temp_c";
+  float tempF = tempC + (TEMP_OFFSET_F * 5.0f / 9.0f);
+#  endif
+#elif defined(SENSOR_BMP280)
+  float tempC = bmp280.readTemperature();
+  float rh    = NAN;
+  bool  hasRH = false;
+  if (isnan(tempC)) {
+    Serial.println("ERROR: BMP280 read failed — skipping publish.");
+    return;
+  }
+#  ifdef USE_IMPERIAL
+  float tempF = tempC * 9.0f / 5.0f + 32.0f + TEMP_OFFSET_F;
+#  else
+  float tempF = tempC + (TEMP_OFFSET_F * 5.0f / 9.0f);
 #  endif
 #endif
 
-  // ── GPS — movement check, baseline refinement, clock sync ───────────────
-  bool hasNewLoc = updateGPS();
-  if (locPending) { hasNewLoc = true; locPending = false; }
+  // ── Daily hi/lo ──────────────────────────────────────────────────────────
+  checkDailySummary(tempF);
 
-  // ── Daily hi/lo tracking and 6 PM summary ────────────────────────────────
-  checkDailySummary(temp);
-
-  // ── Realtime payload ─────────────────────────────────────────────────────
-  char payload[180];
-  if (hasNewLoc) {
+  // ── Realtime status payload ───────────────────────────────────────────────
+  char payload[240];
+#ifdef USE_IMPERIAL
+  if (hasRH)
     snprintf(payload, sizeof(payload),
-      "{\"customerId\":\"cust1\",\"houseId\":\"il\",\"mode\":\"realtime\","
-      "\"%s\":%.1f,\"sats\":%d,\"lat\":%.5f,\"lon\":%.5f}",
-      tempKey, temp, gpsUsedSats, pendingLat, pendingLon);
-  } else {
+      "{\"sn\":\"SIM7-0001\",\"mode\":\"realtime\","
+      "\"temp_f\":%.1f,\"rh\":%.1f,\"mains\":\"%s\",\"fw\":\"%s\"}",
+      tempF, rh, mainsPresent ? "on" : "off", FW_VERSION_STR);
+  else
     snprintf(payload, sizeof(payload),
-      "{\"customerId\":\"cust1\",\"houseId\":\"il\",\"mode\":\"realtime\","
-      "\"%s\":%.1f,\"sats\":%d}",
-      tempKey, temp, gpsVisibleSats);
-  }
+      "{\"sn\":\"SIM7-0001\",\"mode\":\"realtime\","
+      "\"temp_f\":%.1f,\"rh\":null,\"mains\":\"%s\",\"fw\":\"%s\"}",
+      tempF, mainsPresent ? "on" : "off", FW_VERSION_STR);
+#else
+  if (hasRH)
+    snprintf(payload, sizeof(payload),
+      "{\"sn\":\"SIM7-0001\",\"mode\":\"realtime\","
+      "\"temp_c\":%.1f,\"rh\":%.1f,\"mains\":\"%s\",\"fw\":\"%s\"}",
+      tempF, rh, mainsPresent ? "on" : "off", FW_VERSION_STR);
+  else
+    snprintf(payload, sizeof(payload),
+      "{\"sn\":\"SIM7-0001\",\"mode\":\"realtime\","
+      "\"temp_c\":%.1f,\"rh\":null,\"mains\":\"%s\",\"fw\":\"%s\"}",
+      tempF, mainsPresent ? "on" : "off", FW_VERSION_STR);
+#endif
 
   Serial.printf("[%s] %s\n", usingCellular ? "CELL" : "WiFi", payload);
-  mqtt->publish(MQTT_TOPIC, payload, true);   // retain=true: broker holds last reading for fresh dashboard loads
+  mqtt->publish(MQTT_TOPIC, payload, true);
 }

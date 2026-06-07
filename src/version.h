@@ -7,18 +7,18 @@
 //
 //  Release workflow:
 //    1. Increment the numbers below and update FW_VERSION_STR.
-//    2. Commit: git add src/version.h && git commit -m "chore: bump to 1.x.x"
-//    3. Tag:    git tag v1.x.x && git push origin v1.x.x
+//    2. Commit: git add src/version.h && git commit -m "chore: bump sensor to 1.x.x"
+//    3. Tag:    git tag sensor-v1.x.x && git push origin sensor-v1.x.x
 //    4. GitHub Actions builds the binary, publishes a Release,
-//       and updates version.json — devices detect it on next OTA check.
+//       and updates sensor-version.json — devices detect it on next OTA check.
 // ============================================================
 
 #define FW_VERSION_MAJOR  1
-#define FW_VERSION_MINOR  0
+#define FW_VERSION_MINOR  3
 #define FW_VERSION_PATCH  0
 
 // Human-readable string printed to Serial on boot and sent in MQTT status.
-#define FW_VERSION_STR    "1.0.0"
+#define FW_VERSION_STR    "1.3.0"
 
 // Numeric value for integer comparisons during OTA version checks.
 // Encoded as 0x00MMNNPP (Major / Minor / Patch).
