@@ -14,11 +14,11 @@
 // ============================================================
 
 #define FW_VERSION_MAJOR  1
-#define FW_VERSION_MINOR  3
+#define FW_VERSION_MINOR  4
 #define FW_VERSION_PATCH  0
 
 // Human-readable string printed to Serial on boot and sent in MQTT status.
-#define FW_VERSION_STR    "1.3.0"
+#define FW_VERSION_STR    "1.4.0"
 
 // Numeric value for integer comparisons during OTA version checks.
 // Encoded as 0x00MMNNPP (Major / Minor / Patch).

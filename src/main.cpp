@@ -6,8 +6,7 @@
 //
 //  Transport priority:
 //    1. WiFi  → MQTT over TLS (port 8883)
-//    2. Cellular (Hologram) → MQTT plain TCP (port 1883, temp)
-//       TODO: upgrade to TLS once SSLClient confirmed stable
+//    2. Cellular (Hologram) → MQTT over TLS via SSLClient (port 8883)
 //
 //  Sensor: SHT31-D breakout (Adafruit) via I2C
 //    VCC → 3.3V  |  GND → GND  |  SCL → GPIO22  |  SDA → GPIO21
@@ -35,9 +34,10 @@
 //    To release: bump version.h, commit, git tag sensor-vX.Y.Z, push.
 //
 //  MQTT topics:
-//    vacation/cust1/il/temp/status  — realtime temp+humidity+mains (5 min)
-//    vacation/cust1/il/temp/daily   — hi/lo summary at 6 PM Central
-//    vacation/cust1/il/temp/power   — outage/restore events (retained)
+//    vacation/cust1/il/temp/status      — realtime temp+humidity+mains (5 min)
+//    vacation/cust1/il/temp/daily       — hi/lo summary at 6 PM Central
+//    vacation/cust1/il/temp/power       — outage/restore events (retained)
+//    vacation/cust1/il/temp/sensor_raw  — ESP-NOW vibration data from C6 sensor
 // ============================================================
 
 // ─── Unit toggle ─────────────────────────────────────────────────────────────
@@ -57,6 +57,7 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <Wire.h>
+#include <esp_now.h>
 #if defined(SENSOR_SHT31)
   #include <Adafruit_SHT31.h>
 #elif defined(SENSOR_BMP280)
@@ -78,6 +79,7 @@
 #include "secrets.h"    // WiFi + MQTT credentials + OTA_GITHUB_TOKEN (gitignored)
 #include "version.h"    // FW_VERSION_STR — bump before each release
 #include "ota_update.h" // otaInit() / otaLoop()
+#include "ca_cert.h"    // HiveMQ Cloud root CA for SSLClient cellular TLS
 
 // ─── WiFi credentials (from secrets.h) ───────────────────────────────────────
 const char* WIFI_NETWORKS[][2] = {
@@ -89,18 +91,20 @@ const char* WIFI_NETWORKS[][2] = {
 const char* CELLULAR_APN = "hologram";
 
 // ─── MQTT broker ─────────────────────────────────────────────────────────────
+// Both WiFi and cellular use the same HiveMQ Cloud TLS endpoint.
 const char* MQTT_HOST        = "ad21434501c84aad995bc5621bf77f15.s1.eu.hivemq.cloud";
-const int   MQTT_PORT_WIFI   = 8883;
-
-// Cellular test broker — plain TCP (TLS pending SSLClient stability confirmation)
-const char* MQTT_HOST_CELL   = "broker.hivemq.com";
-const int   MQTT_PORT_CELL   = 1883;
+const int   MQTT_PORT        = 8883;
+// Hologram's TinyGsmClient DNS fails on long hostnames — hardcode one IP for cellular.
+// dig ad21434501c84aad995bc5621bf77f15.s1.eu.hivemq.cloud → 46.137.47.218 / 54.73.92.158 / 52.31.149.80
+// SSLClient still sends MQTT_HOST as SNI so TLS cert validation works correctly.
+const char* MQTT_HOST_IP     = "46.137.47.218";
 
 const char* MQTT_USER        = MQTT_USER_VAL;
 const char* MQTT_PASS        = MQTT_PASS_VAL;
 const char* MQTT_TOPIC       = "vacation/cust1/il/temp/status";
 const char* MQTT_DAILY_TOPIC = "vacation/cust1/il/temp/daily";
-const char* MQTT_POWER_TOPIC = "vacation/cust1/il/temp/power";  // retained
+const char* MQTT_POWER_TOPIC = "vacation/cust1/il/temp/power";        // retained
+const char* MQTT_SENSOR_RAW  = "vacation/cust1/il/temp/sensor_raw";   // ESP-NOW vibration
 
 // ─── Hardware pin assignments ─────────────────────────────────────────────────
 #define MODEM_TX      27
@@ -148,16 +152,26 @@ const char* MQTT_POWER_TOPIC = "vacation/cust1/il/temp/power";  // retained
   #endif
 #endif
 
+// ─── ESP-NOW message structure (must match vibration_xiao_c6 firmware exactly) ─
+typedef struct {
+  bool     hvacOn;        // true = furnace vibration detected
+  uint8_t  reason;        // 0 = state change, 1 = heartbeat
+  uint32_t onDurationS;   // seconds vibration has been continuous (0 if off)
+  uint16_t rawMagnitude;  // max axis deviation in ADXL345 counts — for calibration
+} VibrationMsg;
+
+
 // ─── Transport objects ────────────────────────────────────────────────────────
 WiFiClientSecure wifiSecure;
 HardwareSerial   SerialAT(1);
 TinyGsm          modem(SerialAT);
-TinyGsmClient    gsmClient(modem, 0);     // socket 0 — MQTT plain TCP
-TinyGsmClient    gsmClientOTA(modem, 1);  // socket 1 — base TCP for OTA TLS
-SSLClient        sslGsmClient(&gsmClientOTA);
+TinyGsmClient    gsmClientMQTT(modem, 0);  // socket 0 — MQTT base TCP (wrapped by SSL)
+TinyGsmClient    gsmClientOTA(modem, 1);   // socket 1 — OTA base TCP (wrapped by SSL)
+SSLClient        sslGsmMqtt(&gsmClientMQTT);  // TLS for cellular MQTT
+SSLClient        sslGsmOTA(&gsmClientOTA);    // TLS for cellular OTA
 
 PubSubClient  mqttWifi(wifiSecure);
-PubSubClient  mqttCell(gsmClient);
+PubSubClient  mqttCell(sslGsmMqtt);
 PubSubClient* mqtt = nullptr;
 
 bool          usingCellular = false;
@@ -179,6 +193,7 @@ bool          mainsPresent     = true;
 unsigned long powerEdgeMs      = 0;
 bool          powerEdgePending = false;
 unsigned long outageStartMs    = 0;
+
 
 // ─── Daily hi/lo tracking & 6pm summary ──────────────────────────────────────
 void checkDailySummary(float temp) {
@@ -276,6 +291,48 @@ void checkPower() {
   }
 }
 
+// ─── ESP-NOW receive callback ─────────────────────────────────────────────────
+// Called on every incoming VibrationMsg from the C6 vibration sensor.
+// Publishes raw vibration data to MQTT for dashboard + threshold calibration.
+void onVibrationReceived(const esp_now_recv_info_t* info,
+                         const uint8_t* data, int len) {
+  if (len != sizeof(VibrationMsg)) {
+    // Log sender MAC to help identify stray devices (range-test rovers, etc.)
+    Serial.printf("[ESP-NOW] Ignoring %d-byte packet from %02X:%02X:%02X:%02X:%02X:%02X (expected %d bytes)\n",
+      len,
+      info->src_addr[0], info->src_addr[1], info->src_addr[2],
+      info->src_addr[3], info->src_addr[4], info->src_addr[5],
+      sizeof(VibrationMsg));
+    return;
+  }
+  VibrationMsg msg;
+  memcpy(&msg, data, sizeof(msg));
+
+  int8_t rssi = info->rx_ctrl->rssi;
+  Serial.printf("[ESP-NOW] hvac=%s  reason=%s  onDur=%ds  mag=%u  rssi=%d dBm\n",
+    msg.hvacOn ? "ON" : "OFF",
+    msg.reason == 0 ? "state_change" : "heartbeat",
+    msg.onDurationS,
+    msg.rawMagnitude,
+    rssi);
+
+  if (!mqtt || !mqtt->connected()) {
+    Serial.println("[ESP-NOW] MQTT not connected — dropping vibration message.");
+    return;
+  }
+
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+    "{\"sn\":\"EC6-0001\",\"hvac\":\"%s\",\"reason\":\"%s\","
+    "\"on_dur_s\":%lu,\"magnitude\":%u,\"rssi_dbm\":%d}",
+    msg.hvacOn ? "on" : "off",
+    msg.reason == 0 ? "state_change" : "heartbeat",
+    msg.onDurationS,
+    msg.rawMagnitude,
+    rssi);
+  mqtt->publish(MQTT_SENSOR_RAW, payload);
+}
+
 // ─── Modem power-on and initialisation ───────────────────────────────────────
 bool initModem() {
   Serial.println("Powering on SIM7000G...");
@@ -318,6 +375,11 @@ bool connectCellular() {
     Serial.println("ERROR: Cellular connect failed."); return false;
   }
   Serial.printf("Cellular IP: %s\n", modem.localIP().toString().c_str());
+
+  // Hologram's default DNS fails on long hostnames — override with Google DNS
+  modem.sendAT(GF("+CDNSCFG=\"8.8.8.8\",\"8.8.4.4\""));
+  modem.waitResponse(2000L);
+  Serial.println("DNS set to 8.8.8.8 / 8.8.4.4");
   return true;
 }
 
@@ -337,7 +399,7 @@ void syncTimeFromNITZ() {
 
   setenv("TZ", "UTC0", 1); tzset();
   struct tm t = {};
-  t.tm_year  = 2000 + yy - 1900;
+  t.tm_year  = (yy > 99 ? yy : 2000 + yy) - 1900;  // handle 2-digit or 4-digit year
   t.tm_mon   = mo - 1;
   t.tm_mday  = dd;
   t.tm_hour  = hh;
@@ -401,17 +463,35 @@ void initTime() {
   }
 }
 
+
 // ─── MQTT connect ─────────────────────────────────────────────────────────────
 void connectMQTT() {
-  mqtt->setServer(usingCellular ? MQTT_HOST_CELL : MQTT_HOST,
-                  usingCellular ? MQTT_PORT_CELL : MQTT_PORT_WIFI);
+  mqtt->setServer(MQTT_HOST, MQTT_PORT);
   mqtt->setKeepAlive(usingCellular ? 300 : 60);
   while (!mqtt->connected()) {
     Serial.printf("Connecting MQTT [%s]...", usingCellular ? "CELL" : "WiFi");
+
+    if (usingCellular) {
+      // Hologram's TinyGsmClient DNS fails on long HiveMQ subdomain.
+      // Pre-connect the raw TCP socket to the hardcoded IP so SSLClient sees
+      // an already-connected socket and skips its own DNS+TCP step, doing only
+      // the TLS handshake (which uses MQTT_HOST for SNI via setCACert path).
+      if (!gsmClientMQTT.connected()) {
+        Serial.printf("\n  [TCP] Connecting to %s...", MQTT_HOST_IP);
+        if (!gsmClientMQTT.connect(MQTT_HOST_IP, MQTT_PORT)) {
+          Serial.println(" FAILED — retry 5s");
+          delay(5000);
+          continue;
+        }
+        Serial.println(" OK");
+      }
+    }
+
     if (mqtt->connect(deviceId.c_str(), MQTT_USER, MQTT_PASS)) {
       Serial.println(" OK");
     } else {
       Serial.printf(" rc=%d — retry 5s\n", mqtt->state());
+      gsmClientMQTT.stop();  // force TCP reconnect on next attempt
       delay(5000);
     }
   }
@@ -430,6 +510,7 @@ void setup() {
   mainsPresent = (bootAdc >= POWER_ON_THRESH);
   Serial.printf("Power ADC GPIO%d: raw=%d  mains=%s\n",
                 POWER_ADC_PIN, bootAdc, mainsPresent ? "PRESENT" : "ABSENT");
+
 
   // ── Temp/humidity sensor init ─────────────────────────────────────────────
 #ifdef STUB_TEMP
@@ -477,14 +558,18 @@ void setup() {
     deviceId      = "ssHub001-wifi-" + WiFi.macAddress();
     Serial.println("Transport: WiFi");
   } else {
-    WiFi.mode(WIFI_OFF);
+    // Keep WiFi in STA mode (radio off) so ESP-NOW can still be initialized later.
+    // WIFI_OFF would prevent esp_now_init() from working.
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
     if (!connectCellular()) {
       Serial.println("FATAL: No network available."); while (true) delay(10000);
     }
+    sslGsmMqtt.setCACert(HIVEMQ_ROOT_CA);
     mqtt          = &mqttCell;
     usingCellular = true;
     deviceId      = "ssHub001-cell-" + modem.getIMEI();
-    Serial.println("Transport: Cellular (Hologram)");
+    Serial.println("Transport: Cellular (Hologram) — MQTT TLS via SSLClient");
   }
 
   connectMQTT();
@@ -495,24 +580,32 @@ void setup() {
     otaInit(wifiSecure);
     Serial.println("OTA: WiFi (checks hourly)");
   } else {
-    sslGsmClient.setInsecure();
-    otaInit(sslGsmClient);
+    sslGsmOTA.setInsecure();
+    otaInit(sslGsmOTA);
     Serial.println("OTA: Cellular via SSLClient (checks hourly)");
   }
 
+  // ── ESP-NOW ──────────────────────────────────────────────────────────────
+  // WiFi must be in STA mode for ESP-NOW to work. On the cellular path we
+  // already set WIFI_STA above (without connecting) so this is a no-op there.
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[ESP-NOW] Init failed — vibration data unavailable.");
+  } else {
+    esp_now_register_recv_cb(onVibrationReceived);
+    Serial.println("[ESP-NOW] Receiver ready — listening for C6 vibration sensor.");
+  }
+
   // ── Publish restore event if this boot follows a power outage ────────────
-  // If mains is present at boot but the device just rebooted, there may have
-  // been an outage. We publish a one-time restore message with outage_s=0
-  // (duration unknown — reboot cleared the timer). A backend heartbeat gap
-  // can correlate the exact duration from the last seen message timestamp.
+  // Check NVS for a saved outage start timestamp. If found, mains were lost
+  // before the last reboot — calculate real duration using NITZ-synced time.
   if (mainsPresent) {
     char payload[180];
     snprintf(payload, sizeof(payload),
       "{\"sn\":\"SIM7-0001\",\"event\":\"restore\",\"outage_s\":0,"
       "\"adc\":%d,\"fw\":\"%s\",\"note\":\"boot\"}",
       bootAdc, FW_VERSION_STR);
-    mqtt->publish(MQTT_POWER_TOPIC, payload, true);
     Serial.println("[POWER] Published boot-restore event.");
+    mqtt->publish(MQTT_POWER_TOPIC, payload, true);
   }
 }
 
