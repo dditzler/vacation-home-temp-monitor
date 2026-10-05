@@ -3,6 +3,7 @@
 //  See ota_update.h for configuration and public API.
 // ============================================================
 
+#include "secrets.h"      // OTA_GITHUB_TOKEN — must come before ota_update.h
 #include "ota_update.h"
 #include <ArduinoHttpClient.h>
 #include <Update.h>
@@ -39,18 +40,23 @@ static uint32_t parseVersionInt(const String& v) {
   return (maj << 16) | (min << 8) | pat;
 }
 
-// ── Step 1: fetch version.json ────────────────────────────────
+// Returns true if host is a GitHub domain requiring PAT auth.
+static bool isGitHubHost(const String& host) {
+  return host.endsWith("github.com") || host.endsWith("githubusercontent.com");
+}
+
+// ── Step 1: fetch sensor-version.json ─────────────────────────
 static bool fetchManifest(String& outVersion,
                            String& outHost, int& outPort, String& outPath) {
   HttpClient http(*_client, OTA_GITHUB_HOST, 443);
   http.setTimeout(10000);
 
-  Serial.print("[OTA] Checking " OTA_GITHUB_HOST OTA_VERSION_PATH " ... ");
-  if (http.get(OTA_VERSION_PATH) != HTTP_SUCCESS) {
-    Serial.println("connection failed");
-    http.stop();
-    return false;
-  }
+  Serial.print("[OTA] Checking manifest ... ");
+  http.beginRequest();
+  http.get(OTA_VERSION_PATH);
+  http.sendHeader("Authorization", "token " OTA_GITHUB_TOKEN);
+  http.sendHeader("User-Agent", "ESP32-OTA-Sensor");
+  http.endRequest();
 
   int status = http.responseStatusCode();
   if (status != 200) {
@@ -62,13 +68,20 @@ static bool fetchManifest(String& outVersion,
   String body = http.responseBody();
   http.stop();
   Serial.println("OK");
-  Serial.println("[OTA] Manifest: " + body);
 
-  outVersion      = extractJsonStr(body, "version");
+  outVersion       = extractJsonStr(body, "version");
   String binaryUrl = extractJsonStr(body, "binary_url");
 
-  if (outVersion.isEmpty() || binaryUrl.isEmpty()) {
-    Serial.println("[OTA] Manifest missing 'version' or 'binary_url'");
+  if (outVersion.isEmpty()) {
+    Serial.println("[OTA] Manifest missing 'version'");
+    return false;
+  }
+  if (outVersion == "0.0.0") {
+    Serial.println("[OTA] Manifest is placeholder (0.0.0) — skipping");
+    return false;
+  }
+  if (binaryUrl.isEmpty()) {
+    Serial.println("[OTA] Manifest missing 'binary_url'");
     return false;
   }
   if (!binaryUrl.startsWith("https://")) {
@@ -76,7 +89,6 @@ static bool fetchManifest(String& outVersion,
     return false;
   }
 
-  // Split "https://HOST/PATH" into components
   String rest = binaryUrl.substring(8);
   int slash   = rest.indexOf('/');
   if (slash < 0) { Serial.println("[OTA] Malformed binary_url"); return false; }
@@ -88,27 +100,70 @@ static bool fetchManifest(String& outVersion,
 }
 
 // ── Step 2: download binary and write to flash ────────────────
+// ArduinoHttpClient has no response-header API, so we use raw
+// Client reads to parse the status line, headers (for Location
+// on redirects), and body (streamed directly into Update).
+// includeAuth=true on first call (GitHub API); false after
+// redirect to CDN/S3 (which uses pre-signed query params).
 static bool downloadAndFlash(const String& host, int port,
-                              const String& path, int depth = 0) {
-  if (depth > 2) { Serial.println("[OTA] Too many redirects"); return false; }
+                              const String& path,
+                              bool includeAuth, int depth = 0) {
+  if (depth > 3) { Serial.println("[OTA] Too many redirects"); return false; }
 
-  Serial.println("[OTA] Downloading from " + host + path);
+  Serial.println("[OTA] GET " + host + path);
 
-  HttpClient http(*_client, host, port);
-  http.setTimeout(60000);   // large binary over WiFi — give it time
-
-  if (http.get(path) != HTTP_SUCCESS) {
-    Serial.println("[OTA] Download connection failed");
-    http.stop();
+  // Open a fresh TLS connection to this host
+  _client->stop();
+  if (!_client->connect(host.c_str(), (uint16_t)port)) {
+    Serial.println("[OTA] Connect failed: " + host);
     return false;
   }
 
-  int status = http.responseStatusCode();
+  // Send raw HTTP/1.0 request (avoids chunked Transfer-Encoding)
+  _client->print("GET "); _client->print(path); _client->println(" HTTP/1.0");
+  _client->print("Host: "); _client->println(host);
+  if (includeAuth && isGitHubHost(host)) {
+    _client->print("Authorization: token "); _client->println(OTA_GITHUB_TOKEN);
+    _client->println("Accept: application/octet-stream");
+  }
+  _client->println("User-Agent: ESP32-OTA-Sensor");
+  _client->println();   // blank line = end of request headers
 
-  // Follow redirects (GitHub Releases redirect to objects.githubusercontent.com)
-  if (status == 301 || status == 302 || status == 307 || status == 308) {
-    String location = http.header("Location");
-    http.stop();
+  // Wait for first response byte (up to 30 s)
+  unsigned long t0 = millis();
+  while (!_client->available() && _client->connected() && millis() - t0 < 30000UL) delay(10);
+  if (!_client->available()) {
+    Serial.println("[OTA] Response timeout");
+    _client->stop();
+    return false;
+  }
+
+  // ── Parse status line: "HTTP/1.x NNN Reason\r\n" ─────────────
+  _client->setTimeout(10000);
+  String statusLine = _client->readStringUntil('\n');
+  statusLine.trim();
+  int sp = statusLine.indexOf(' ');
+  int statusCode = (sp >= 0) ? statusLine.substring(sp + 1, sp + 4).toInt() : 0;
+
+  // ── Parse response headers ────────────────────────────────────
+  String location = "";
+  int    contentLength = -1;
+  while (_client->connected() || _client->available()) {
+    String line = _client->readStringUntil('\n');
+    line.trim();
+    if (line.isEmpty()) break;   // blank line = end of headers
+    String lower = line; lower.toLowerCase();
+    if (lower.startsWith("location:")) {
+      location = line.substring(line.indexOf(':') + 1);
+      location.trim();
+    } else if (lower.startsWith("content-length:")) {
+      contentLength = line.substring(line.indexOf(':') + 1).toInt();
+    }
+  }
+
+  // ── Follow redirects ──────────────────────────────────────────
+  if (statusCode >= 300 && statusCode < 400) {
+    _client->stop();
     if (location.isEmpty()) {
       Serial.println("[OTA] Redirect with no Location header");
       return false;
@@ -118,61 +173,60 @@ static bool downloadAndFlash(const String& host, int port,
       Serial.println("[OTA] Non-HTTPS redirect — aborting");
       return false;
     }
-    String rest  = location.substring(8);
-    int    slash = rest.indexOf('/');
+    String rest      = location.substring(8);
+    int    slash     = rest.indexOf('/');
     if (slash < 0) return false;
-    return downloadAndFlash(rest.substring(0, slash), 443,
-                            rest.substring(slash), depth + 1);
+    String redirHost = rest.substring(0, slash);
+    String redirPath = rest.substring(slash);
+    return downloadAndFlash(redirHost, 443, redirPath,
+                            isGitHubHost(redirHost), depth + 1);
   }
 
-  if (status != 200) {
-    Serial.println("[OTA] Download HTTP " + String(status));
-    http.stop();
+  if (statusCode != 200) {
+    Serial.println("[OTA] HTTP " + String(statusCode));
+    _client->stop();
     return false;
   }
 
-  int contentLength = http.contentLength();
+  // ── Stream body → OTA flash ───────────────────────────────────
   Serial.println("[OTA] Content-Length: " + String(contentLength) + " bytes");
-
   if (!Update.begin(contentLength > 0 ? contentLength : UPDATE_SIZE_UNKNOWN)) {
     Serial.println("[OTA] Update.begin() failed: " + String(Update.errorString()));
-    http.stop();
+    _client->stop();
     return false;
   }
 
-  uint8_t  buf[512];
-  int      written   = 0;
-  int      remaining = contentLength > 0 ? contentLength : INT_MAX;
+  uint8_t buf[512];
+  int     written   = 0;
+  int     remaining = (contentLength > 0) ? contentLength : INT_MAX;
 
-  while (http.connected() && remaining > 0) {
-    int avail = http.available();
+  while ((_client->connected() || _client->available()) && remaining > 0) {
+    int avail = _client->available();
     if (avail > 0) {
-      int n = http.read(buf, min(avail, (int)sizeof(buf)));
+      int n = _client->read(buf, min(avail, (int)sizeof(buf)));
       n = min(n, remaining);
       if (n > 0) {
         if ((int)Update.write(buf, n) != n) {
           Serial.println("[OTA] Flash write error: " + String(Update.errorString()));
-          http.stop();
+          _client->stop();
           Update.abort();
           return false;
         }
         written   += n;
         remaining -= n;
-        if (written % 20480 == 0) {
+        if (written % 20480 == 0)
           Serial.printf("[OTA] Written %d / %d bytes\n", written, contentLength);
-        }
       }
     } else {
       delay(5);
     }
   }
-  http.stop();
+  _client->stop();
 
   if (!Update.end(true)) {
     Serial.println("[OTA] Update.end() error: " + String(Update.errorString()));
     return false;
   }
-
   Serial.printf("[OTA] Flash complete (%d bytes). Rebooting...\n", written);
   return true;
 }
@@ -209,8 +263,8 @@ bool otaCheckNow() {
 
   Serial.println("[OTA] Update available — flashing...");
 
-  // 3. Download and flash
-  if (!downloadAndFlash(binHost, binPort, binPath)) {
+  // 3. Download and flash — pass auth=true; stripped on CDN redirects
+  if (!downloadAndFlash(binHost, binPort, binPath, true)) {
     Serial.println("[OTA] Update failed — will retry next check.");
     return false;
   }

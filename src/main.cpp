@@ -30,14 +30,22 @@
 //  OTA:
 //    WiFi path  → WiFiClientSecure (native TLS)
 //    Cellular   → SSLClient over TinyGsmClient socket 1
-//    Checks hourly; reboots automatically on new version.
+//    Checks every OTA_CHECK_INTERVAL_S (daily on tsim7000g); SMS "ota" forces a check.
+//    Reboots automatically on new version.
 //    To release: bump version.h, commit, git tag sensor-vX.Y.Z, push.
 //
 //  MQTT topics:
-//    vacation/cust1/il/temp/status      — realtime temp+humidity+mains (5 min)
+//    vacation/cust1/il/temp/status      — realtime temp+humidity+mains (10 min; 2 min below 55°F)
 //    vacation/cust1/il/temp/daily       — hi/lo summary at 6 PM Central
 //    vacation/cust1/il/temp/power       — outage/restore events (retained)
-//    vacation/cust1/il/temp/sensor_raw  — ESP-NOW vibration data from C6 sensor
+//    vacation/cust1/il/temp/sensor_raw  — ESP-NOW vibration relay (only with -DENABLE_ESPNOW_RELAY)
+//
+//  Low-data notes (fw 1.4.1):
+//    - MQTT reconnects use exponential backoff (15 s → 30 min cap). A failing
+//      TLS handshake costs ~5 KB; the old fixed 5 s retry burned ~1.5 MB/hr.
+//    - ESP-NOW vibration relay is compiled out unless ENABLE_ESPNOW_RELAY.
+//    - Status payload carries "reconn" (MQTT reconnects since boot) so silent
+//      NAT drops / handshake churn are visible from the broker side.
 // ============================================================
 
 // ─── Unit toggle ─────────────────────────────────────────────────────────────
@@ -79,7 +87,7 @@
 #include "secrets.h"    // WiFi + MQTT credentials + OTA_GITHUB_TOKEN (gitignored)
 #include "version.h"    // FW_VERSION_STR — bump before each release
 #include "ota_update.h" // otaInit() / otaLoop()
-#include "ca_cert.h"    // HiveMQ Cloud root CA for SSLClient cellular TLS
+#include "ca_cert.h"    // Broker root CA bundle for SSLClient cellular TLS
 
 // ─── WiFi credentials (from secrets.h) ───────────────────────────────────────
 const char* WIFI_NETWORKS[][2] = {
@@ -91,13 +99,23 @@ const char* WIFI_NETWORKS[][2] = {
 const char* CELLULAR_APN = "hologram";
 
 // ─── MQTT broker ─────────────────────────────────────────────────────────────
-// Both WiFi and cellular use the same HiveMQ Cloud TLS endpoint.
-const char* MQTT_HOST        = "ad21434501c84aad995bc5621bf77f15.s1.eu.hivemq.cloud";
+// EMQX Cloud Serverless (free tier), deployment "ernie" in project SteadyState,
+// AWS us-east-1. Console login: Google account david@ditzco.com.
+// (fw <= 1.4.2 used HiveMQ Cloud Serverless, retired 2026-12-31.)
+//
+// To move to another broker: change MQTT_HOST / MQTT_PORT, refresh the fallback
+// IPs (dig <host>), make sure ca_cert.h holds its root CA, and update
+// MQTT_USER_VAL / MQTT_PASS_VAL in secrets.h.
+const char* MQTT_HOST        = "d11f1164.ala.us-east-1.emqxsl.com";
 const int   MQTT_PORT        = 8883;
-// Hologram's TinyGsmClient DNS fails on long hostnames — hardcode one IP for cellular.
-// dig ad21434501c84aad995bc5621bf77f15.s1.eu.hivemq.cloud → 46.137.47.218 / 54.73.92.158 / 52.31.149.80
-// SSLClient still sends MQTT_HOST as SNI so TLS cert validation works correctly.
-const char* MQTT_HOST_IP     = "46.137.47.218";
+// Cellular connects by hostname first (modem DNS, set to 8.8.8.8 in
+// connectCellular). If that fails, it tries these IPs in order — they can go
+// stale, which is why they are only a fallback.
+// dig d11f1164.ala.us-east-1.emqxsl.com → 23.23.126.71 / 100.51.47.111 (2026-10-04)
+// SSLClient still sends MQTT_HOST as SNI so TLS cert validation works either way.
+const char* MQTT_HOST_FALLBACK_IPS[] = { "23.23.126.71", "100.51.47.111" };
+const int   MQTT_HOST_FALLBACK_N =
+  sizeof(MQTT_HOST_FALLBACK_IPS) / sizeof(MQTT_HOST_FALLBACK_IPS[0]);
 
 const char* MQTT_USER        = MQTT_USER_VAL;
 const char* MQTT_PASS        = MQTT_PASS_VAL;
@@ -127,9 +145,36 @@ const char* MQTT_SENSOR_RAW  = "vacation/cust1/il/temp/sensor_raw";   // ESP-NOW
 
 // ─── Timing ──────────────────────────────────────────────────────────────────
 #ifndef PUBLISH_INTERVAL
-#define PUBLISH_INTERVAL  300000UL   // 5 minutes on cellular
+#define PUBLISH_INTERVAL  600000UL   // 10 minutes on cellular (normal temps)
 #endif
+
+// The sensor is read locally every SENSOR_SAMPLE_MS (no data cost). A status
+// message is published when:
+//   - PUBLISH_INTERVAL has elapsed (normal), or
+//   - COLD_PUBLISH_INTERVAL has elapsed while temp < COLD_WATCH_F, or
+//   - the temp crosses into / out of a cold band (immediate).
+// Bands: 0 = normal (>= 55°F), 1 = watch (< 55°F), 2 = alert (< 50°F).
+// Leaving a colder band requires COLD_HYST_F above its threshold (no flapping).
+#ifndef SENSOR_SAMPLE_MS
+#define SENSOR_SAMPLE_MS        60000UL    // read sensor every 1 min
+#endif
+#ifndef COLD_PUBLISH_INTERVAL
+#define COLD_PUBLISH_INTERVAL  120000UL    // 2 min while below COLD_WATCH_F
+#endif
+#define COLD_WATCH_F   55.0f
+#define COLD_ALERT_F   50.0f   // matches dashboard "cold" color threshold
+#define COLD_HYST_F     0.5f
 #define WIFI_TIMEOUT_MS    30000UL
+
+// MQTT keepalive on cellular (seconds). Kept just above PUBLISH_INTERVAL so the
+// regular publish doubles as the keepalive and PINGREQs are rare.
+#ifndef MQTT_KEEPALIVE_CELL_S
+#define MQTT_KEEPALIVE_CELL_S  ((uint16_t)(PUBLISH_INTERVAL / 1000UL + 120UL))
+#endif
+
+// MQTT reconnect backoff — doubles after each failure, resets on success.
+#define MQTT_BACKOFF_MIN_MS    15000UL     // 15 s
+#define MQTT_BACKOFF_MAX_MS  1800000UL     // 30 min cap (~240 KB/day worst case)
 
 // ─── Time zone ───────────────────────────────────────────────────────────────
 #define TZ_CENTRAL "CST6CDT,M3.2.0,M11.1.0"
@@ -152,13 +197,22 @@ const char* MQTT_SENSOR_RAW  = "vacation/cust1/il/temp/sensor_raw";   // ESP-NOW
   #endif
 #endif
 
+// ─── Hologram SMS downlink config ────────────────────────────────────────────
+// The hub polls for incoming SMS every SMS_POLL_INTERVAL_MS.
+// Recognized commands (sent via hologram_monitor.py --send-sms <cmd>):
+//   ping   — publish a status payload immediately
+//   reboot — reboot the ESP32
+//   ota    — trigger an OTA check immediately
+// Unrecognized SMS bodies are logged but ignored.
+#define SMS_POLL_INTERVAL_MS  60000UL    // poll once per minute
+
 // ─── ESP-NOW message structure (must match vibration_xiao_c6 firmware exactly) ─
+// fw 1.1.0: simplified — no on/off decision in sensor firmware.
+// Hub injects hub_temp_f + hub_temp_trend into MQTT payload; cloud assembles cycles.
 typedef struct {
-  bool     hvacOn;        // true = furnace vibration detected
-  uint8_t  reason;        // 0 = state change, 1 = heartbeat
-  uint32_t onDurationS;   // seconds vibration has been continuous (0 if off)
-  uint16_t rawMagnitude;  // max axis deviation in ADXL345 counts — for calibration
-} VibrationMsg;
+  uint8_t  wakeReason;    // 0=activity interrupt, 1=timer, 2=heartbeat
+  uint16_t rawMagnitude;  // max axis range in ADXL345 counts this wake
+} VibrationMsg;           // sizeof = 4 bytes
 
 
 // ─── Transport objects ────────────────────────────────────────────────────────
@@ -176,6 +230,30 @@ PubSubClient* mqtt = nullptr;
 
 bool          usingCellular = false;
 unsigned long lastPublish   = 0;
+unsigned long lastSample    = 0;
+uint8_t       lastColdBand  = 0;   // 0 normal, 1 watch (<55°F), 2 alert (<50°F)
+
+// Cold band with hysteresis — see COLD_* defines.
+uint8_t calcColdBand(float f, uint8_t prev) {
+  uint8_t b = (f < COLD_ALERT_F) ? 2 : (f < COLD_WATCH_F) ? 1 : 0;
+  if (b < prev) {   // warming up: only leave the colder band once clearly above it
+    float thr = (prev == 2) ? COLD_ALERT_F : COLD_WATCH_F;
+    if (f < thr + COLD_HYST_F) b = prev;
+  }
+  return b;
+}
+
+// MQTT reconnect state (see connectMQTT)
+unsigned long mqttLastAttempt  = 0;
+unsigned long mqttWaitMs       = 0;      // 0 → first attempt is immediate
+uint32_t      mqttReconnects   = 0;      // successful connects after the first
+bool          mqttEverConnected = false;
+
+// Boot-restore event is queued and sent on the first successful connect,
+// so it isn't lost if the broker is unreachable at boot.
+char          bootEventPayload[180];
+bool          bootEventPending = false;
+unsigned long lastSmsPoll   = 0;
 String        deviceId;
 
 // ─── Time state ──────────────────────────────────────────────────────────────
@@ -193,6 +271,47 @@ bool          mainsPresent     = true;
 unsigned long powerEdgeMs      = 0;
 bool          powerEdgePending = false;
 unsigned long outageStartMs    = 0;
+
+// ─── Hub temp trend — rolling 15-min window ──────────────────────────────────
+// Stores the last N temp readings with timestamps. onVibrationReceived() reads
+// these to inject hub_temp_f and hub_temp_trend into the sensor_raw MQTT payload.
+// Trend: +1 = rose >0.5°F in window, -1 = fell >0.5°F, 0 = flat.
+#define TEMP_HISTORY_SIZE  10   // at 5-min publish interval = 50-min window max
+struct TempSample { unsigned long ts; float tempF; };
+TempSample    tempHistory[TEMP_HISTORY_SIZE];
+int           tempHistoryIdx   = 0;
+int           tempHistoryCount = 0;
+float         latestTempF      = NAN;  // most recent reading
+
+void recordTempSample(float tempF) {
+  latestTempF = tempF;
+  tempHistory[tempHistoryIdx] = { millis(), tempF };
+  tempHistoryIdx = (tempHistoryIdx + 1) % TEMP_HISTORY_SIZE;
+  if (tempHistoryCount < TEMP_HISTORY_SIZE) tempHistoryCount++;
+}
+
+// Returns +1 (rising), -1 (falling), 0 (flat) based on oldest vs newest sample
+// within a 15-min window. Requires at least 2 samples.
+int8_t calcTempTrend() {
+  if (tempHistoryCount < 2) return 0;
+  unsigned long now = millis();
+  unsigned long windowMs = 15UL * 60UL * 1000UL;  // 15 minutes
+
+  // Find oldest sample within window
+  float oldest = NAN;
+  for (int i = 0; i < tempHistoryCount; i++) {
+    int idx = (tempHistoryIdx - tempHistoryCount + i + TEMP_HISTORY_SIZE) % TEMP_HISTORY_SIZE;
+    if (now - tempHistory[idx].ts <= windowMs) {
+      if (isnan(oldest)) oldest = tempHistory[idx].tempF;
+    }
+  }
+  if (isnan(oldest) || isnan(latestTempF)) return 0;
+
+  float delta = latestTempF - oldest;
+  if (delta >  0.5f) return  1;
+  if (delta < -0.5f) return -1;
+  return 0;
+}
 
 
 // ─── Daily hi/lo tracking & 6pm summary ──────────────────────────────────────
@@ -292,45 +411,163 @@ void checkPower() {
 }
 
 // ─── ESP-NOW receive callback ─────────────────────────────────────────────────
-// Called on every incoming VibrationMsg from the C6 vibration sensor.
-// Publishes raw vibration data to MQTT for dashboard + threshold calibration.
-void onVibrationReceived(const esp_now_recv_info_t* info,
+// Called on every incoming VibrationMsg from the C6 vibration sensor (fw 1.1.0+).
+// Injects hub_temp_f + hub_temp_trend into the MQTT payload so the cloud can
+// assemble cycles and calibrate per device without any firmware thresholds.
+void onVibrationReceived(const uint8_t* mac_addr,
                          const uint8_t* data, int len) {
   if (len != sizeof(VibrationMsg)) {
-    // Log sender MAC to help identify stray devices (range-test rovers, etc.)
-    Serial.printf("[ESP-NOW] Ignoring %d-byte packet from %02X:%02X:%02X:%02X:%02X:%02X (expected %d bytes)\n",
+    Serial.printf("[ESP-NOW] Ignoring %d-byte packet from %02X:%02X:%02X:%02X:%02X:%02X (expected %d)\n",
       len,
-      info->src_addr[0], info->src_addr[1], info->src_addr[2],
-      info->src_addr[3], info->src_addr[4], info->src_addr[5],
+      mac_addr[0], mac_addr[1], mac_addr[2],
+      mac_addr[3], mac_addr[4], mac_addr[5],
       sizeof(VibrationMsg));
     return;
   }
   VibrationMsg msg;
   memcpy(&msg, data, sizeof(msg));
 
-  int8_t rssi = info->rx_ctrl->rssi;
-  Serial.printf("[ESP-NOW] hvac=%s  reason=%s  onDur=%ds  mag=%u  rssi=%d dBm\n",
-    msg.hvacOn ? "ON" : "OFF",
-    msg.reason == 0 ? "state_change" : "heartbeat",
-    msg.onDurationS,
-    msg.rawMagnitude,
-    rssi);
+  int8_t rssi      = 0;  // legacy cb doesn't carry RSSI; use 0 as sentinel
+  float  hubTemp   = isnan(latestTempF) ? -999.0f : latestTempF;
+  int8_t tempTrend = calcTempTrend();   // +1 rising, -1 falling, 0 flat
+
+  const char* reasonStr =
+    msg.wakeReason == 0 ? "activity" :
+    msg.wakeReason == 2 ? "heartbeat" : "timer";
+
+  Serial.printf("[ESP-NOW] reason=%s  mag=%u  rssi=%d dBm  hub_temp=%.1f°F  trend=%+d\n",
+    reasonStr, msg.rawMagnitude, rssi, hubTemp, tempTrend);
 
   if (!mqtt || !mqtt->connected()) {
     Serial.println("[ESP-NOW] MQTT not connected — dropping vibration message.");
     return;
   }
 
-  char payload[160];
+  char payload[192];
   snprintf(payload, sizeof(payload),
-    "{\"sn\":\"EC6-0001\",\"hvac\":\"%s\",\"reason\":\"%s\","
-    "\"on_dur_s\":%lu,\"magnitude\":%u,\"rssi_dbm\":%d}",
-    msg.hvacOn ? "on" : "off",
-    msg.reason == 0 ? "state_change" : "heartbeat",
-    msg.onDurationS,
+    "{\"sn\":\"EC6-0001\",\"reason\":\"%s\","
+    "\"magnitude\":%u,\"rssi_dbm\":%d,"
+    "\"hub_temp_f\":%.1f,\"hub_temp_trend\":%d}",
+    reasonStr,
     msg.rawMagnitude,
-    rssi);
+    rssi,
+    hubTemp,
+    tempTrend);
   mqtt->publish(MQTT_SENSOR_RAW, payload);
+}
+
+// ─── Hologram SMS downlink handler ───────────────────────────────────────────
+// Polls the SIM7000G for incoming SMS. On cellular path only — WiFi path has
+// no SIM so there's nothing to poll.
+//
+// Commands are matched case-insensitively against the SMS body (trimmed).
+// After acting, the SMS is deleted from the SIM to prevent re-processing.
+//
+// To send a command:
+//   python3 hologram_monitor.py --send-sms "ping"
+//
+// Read a single SMS by index using raw AT+CMGR.
+// Returns the message body, or "" if no message at that index.
+// SIM7000G response format:
+//   +CMGR: "REC READ","<number>",,"<timestamp>"
+//   <body text>
+//   OK
+static String smsReadAt(int idx) {
+  modem.sendAT(GF("+CMGR="), idx);
+  if (modem.waitResponse(3000L, GF("+CMGR:")) != 1) return "";
+  modem.stream.readStringUntil('\n');  // skip header line (sender, timestamp)
+  String body = modem.stream.readStringUntil('\n');
+  modem.waitResponse(1000L);  // consume trailing OK
+  body.trim();
+  return body;
+}
+
+// Delete an SMS by index using raw AT+CMGD.
+static void smsDeleteAt(int idx) {
+  modem.sendAT(GF("+CMGD="), idx);
+  modem.waitResponse(2000L);
+}
+
+void checkSMS() {
+  if (!usingCellular) return;   // no SIM on WiFi path
+
+  // List all stored SMS with AT+CMGL="ALL" and process each.
+  // Simpler than iterating fixed indices — works regardless of SIM slot layout.
+  // Format per entry:
+  //   +CMGL: <idx>,"REC READ","<sender>",,"<ts>"
+  //   <body>
+  modem.sendAT(GF("+CMGL=\"ALL\""));
+  if (modem.waitResponse(5000L, GF("+CMGL:")) != 1) {
+    // No messages (response is just "OK") — normal, nothing to do.
+    return;
+  }
+
+  // Parse each message entry
+  while (true) {
+    // We've already consumed "+CMGL:" for the first entry (or loop continues).
+    // Read the header to extract index.
+    String header = modem.stream.readStringUntil('\n');
+    header.trim();
+    // header looks like: <idx>,"REC UNREAD","...",,"..."
+    int idx = header.toInt();   // toInt() stops at first non-digit
+
+    String body = modem.stream.readStringUntil('\n');
+    body.trim();
+
+    if (body.length() == 0) break;
+
+    String bodyLower = body;
+    bodyLower.toLowerCase();
+    Serial.printf("[SMS] idx=%d body='%s'\n", idx, body.c_str());
+
+    if (bodyLower == "ping") {
+      if (mqtt && mqtt->connected()) {
+        char payload[160];
+        snprintf(payload, sizeof(payload),
+          "{\"sn\":\"SIM7-0001\",\"event\":\"pong\","
+          "\"fw\":\"%s\",\"mains\":\"%s\"}",
+          FW_VERSION_STR, mainsPresent ? "on" : "off");
+        mqtt->publish(MQTT_TOPIC, payload, false);
+        Serial.println("[SMS] pong published to MQTT.");
+      }
+
+    } else if (bodyLower == "reboot") {
+      Serial.println("[SMS] Reboot command — rebooting in 2s...");
+      if (mqtt && mqtt->connected()) {
+        char payload[100];
+        snprintf(payload, sizeof(payload),
+          "{\"sn\":\"SIM7-0001\",\"event\":\"reboot_cmd\",\"fw\":\"%s\"}",
+          FW_VERSION_STR);
+        mqtt->publish(MQTT_TOPIC, payload, false);
+        delay(500);
+      }
+      smsDeleteAt(idx);
+      delay(1000);
+      ESP.restart();
+      return;
+
+    } else if (bodyLower == "ota") {
+      // otaLoop() has its own internal timer; we can't reset it without an
+      // extern. Log the command and let the next hourly check pick it up.
+      Serial.println("[SMS] OTA command — will check at next scheduled interval.");
+      if (mqtt && mqtt->connected()) {
+        char payload[100];
+        snprintf(payload, sizeof(payload),
+          "{\"sn\":\"SIM7-0001\",\"event\":\"ota_cmd\",\"fw\":\"%s\"}",
+          FW_VERSION_STR);
+        mqtt->publish(MQTT_TOPIC, payload, false);
+      }
+
+    } else {
+      Serial.printf("[SMS] Unrecognized command: '%s' — ignoring.\n", body.c_str());
+    }
+
+    smsDeleteAt(idx);
+
+    // Check if there's another entry
+    if (modem.waitResponse(1000L, GF("+CMGL:")) != 1) break;
+  }
+  modem.waitResponse(1000L);  // consume final OK
 }
 
 // ─── Modem power-on and initialisation ───────────────────────────────────────
@@ -394,8 +631,10 @@ void syncTimeFromNITZ() {
     Serial.println("[NITZ] No time from network — clock not yet synced.");
     return;
   }
-  // tz_f is in quarter-hours (e.g. -24.0 = UTC-6). Convert to seconds.
-  int tzOffsetSec = (int)(tz_f * 15.0f * 60.0f);
+  // TinyGSM already converts the modem's quarter-hour offset to HOURS
+  // (TinyGsmTime.tpp: *timezone = itimezone / 4.0), so tz_f = -5.0 means UTC-5.
+  // fw <= 1.4.1 treated it as quarter-hours (×15 min) → clock ran ~3.75 h slow.
+  int tzOffsetSec = (int)(tz_f * 3600.0f);
 
   setenv("TZ", "UTC0", 1); tzset();
   struct tm t = {};
@@ -416,7 +655,7 @@ void syncTimeFromNITZ() {
   struct tm ct;
   localtime_r(&epoch, &ct);
   char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &ct);
-  Serial.printf("[NITZ] Synced: %s Central (tz_offset=%.2f qhr)\n", buf, tz_f);
+  Serial.printf("[NITZ] Synced: %s Central (network tz=UTC%+.2f h)\n", buf, tz_f);
 }
 
 // ─── WiFi connect ────────────────────────────────────────────────────────────
@@ -464,37 +703,62 @@ void initTime() {
 }
 
 
-// ─── MQTT connect ─────────────────────────────────────────────────────────────
-void connectMQTT() {
-  mqtt->setServer(MQTT_HOST, MQTT_PORT);
-  mqtt->setKeepAlive(usingCellular ? 300 : 60);
-  while (!mqtt->connected()) {
-    Serial.printf("Connecting MQTT [%s]...", usingCellular ? "CELL" : "WiFi");
+// ─── MQTT connect (non-blocking, exponential backoff) ────────────────────────
+// Makes at most ONE connection attempt per call, and only once the current
+// backoff window has elapsed. Returns true if connected.
+// Never blocks the loop, so SMS commands (reboot/ota/ping) keep working
+// while the broker is unreachable.
+bool connectMQTT() {
+  if (mqtt->connected()) return true;
+  if (millis() - mqttLastAttempt < mqttWaitMs) return false;
+  mqttLastAttempt = millis();
 
-    if (usingCellular) {
-      // Hologram's TinyGsmClient DNS fails on long HiveMQ subdomain.
-      // Pre-connect the raw TCP socket to the hardcoded IP so SSLClient sees
-      // an already-connected socket and skips its own DNS+TCP step, doing only
-      // the TLS handshake (which uses MQTT_HOST for SNI via setCACert path).
-      if (!gsmClientMQTT.connected()) {
-        Serial.printf("\n  [TCP] Connecting to %s...", MQTT_HOST_IP);
-        if (!gsmClientMQTT.connect(MQTT_HOST_IP, MQTT_PORT)) {
-          Serial.println(" FAILED — retry 5s");
-          delay(5000);
-          continue;
-        }
-        Serial.println(" OK");
+  mqtt->setServer(MQTT_HOST, MQTT_PORT);
+  mqtt->setKeepAlive(usingCellular ? MQTT_KEEPALIVE_CELL_S : 60);
+  Serial.printf("Connecting MQTT [%s]...", usingCellular ? "CELL" : "WiFi");
+
+  bool ok = true;
+  if (usingCellular) {
+    // Re-open the data bearer if the network dropped it.
+    if (!modem.isGprsConnected()) {
+      Serial.print("\n  [GPRS] Bearer down — reconnecting...");
+      ok = modem.gprsConnect(CELLULAR_APN, "", "");
+      Serial.println(ok ? " OK" : " FAILED");
+    }
+    // Pre-connect the raw TCP socket so SSLClient sees an already-connected
+    // socket and skips its own DNS+TCP step, doing only the TLS handshake
+    // (which still uses MQTT_HOST for SNI + certificate hostname check).
+    // Try the hostname first (survives broker IP changes), then fallback IPs.
+    if (ok && !gsmClientMQTT.connected()) {
+      Serial.printf("\n  [TCP] Connecting to %s...", MQTT_HOST);
+      ok = gsmClientMQTT.connect(MQTT_HOST, MQTT_PORT);
+      Serial.println(ok ? " OK" : " FAILED");
+      for (int i = 0; !ok && i < MQTT_HOST_FALLBACK_N; i++) {
+        gsmClientMQTT.stop();
+        Serial.printf("  [TCP] Fallback IP %s...", MQTT_HOST_FALLBACK_IPS[i]);
+        ok = gsmClientMQTT.connect(MQTT_HOST_FALLBACK_IPS[i], MQTT_PORT);
+        Serial.println(ok ? " OK" : " FAILED");
       }
     }
-
-    if (mqtt->connect(deviceId.c_str(), MQTT_USER, MQTT_PASS)) {
-      Serial.println(" OK");
-    } else {
-      Serial.printf(" rc=%d — retry 5s\n", mqtt->state());
-      gsmClientMQTT.stop();  // force TCP reconnect on next attempt
-      delay(5000);
-    }
   }
+
+  if (ok && mqtt->connect(deviceId.c_str(), MQTT_USER, MQTT_PASS)) {
+    Serial.println(" OK");
+    if (mqttEverConnected) mqttReconnects++;
+    mqttEverConnected = true;
+    mqttWaitMs = MQTT_BACKOFF_MIN_MS;   // next failure starts small again
+    return true;
+  }
+
+  if (ok) Serial.printf(" rc=%d", mqtt->state());
+  if (usingCellular) {
+    sslGsmMqtt.stop();    // reset TLS session state
+    gsmClientMQTT.stop(); // force TCP reconnect on next attempt
+  }
+  mqttWaitMs = (mqttWaitMs == 0) ? MQTT_BACKOFF_MIN_MS
+             : min(mqttWaitMs * 2UL, MQTT_BACKOFF_MAX_MS);
+  Serial.printf(" — retry in %lu s\n", mqttWaitMs / 1000UL);
+  return false;
 }
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
@@ -561,11 +825,15 @@ void setup() {
     // Keep WiFi in STA mode (radio off) so ESP-NOW can still be initialized later.
     // WIFI_OFF would prevent esp_now_init() from working.
     WiFi.disconnect(true);
+#ifdef ENABLE_ESPNOW_RELAY
     WiFi.mode(WIFI_STA);
+#else
+    WiFi.mode(WIFI_OFF);   // no ESP-NOW relay in this build — radio fully off
+#endif
     if (!connectCellular()) {
       Serial.println("FATAL: No network available."); while (true) delay(10000);
     }
-    sslGsmMqtt.setCACert(HIVEMQ_ROOT_CA);
+    sslGsmMqtt.setCACert(BROKER_ROOT_CA);
     mqtt          = &mqttCell;
     usingCellular = true;
     deviceId      = "ssHub001-cell-" + modem.getIMEI();
@@ -582,9 +850,11 @@ void setup() {
   } else {
     sslGsmOTA.setInsecure();
     otaInit(sslGsmOTA);
-    Serial.println("OTA: Cellular via SSLClient (checks hourly)");
+    Serial.printf("OTA: Cellular via SSLClient (checks every %lu h)\n",
+                  (unsigned long)OTA_CHECK_INTERVAL_S / 3600UL);
   }
 
+#ifdef ENABLE_ESPNOW_RELAY
   // ── ESP-NOW ──────────────────────────────────────────────────────────────
   // WiFi must be in STA mode for ESP-NOW to work. On the cellular path we
   // already set WIFI_STA above (without connecting) so this is a no-op there.
@@ -594,6 +864,9 @@ void setup() {
     esp_now_register_recv_cb(onVibrationReceived);
     Serial.println("[ESP-NOW] Receiver ready — listening for C6 vibration sensor.");
   }
+#else
+  Serial.println("[ESP-NOW] Relay disabled in this build (low-data mode).");
+#endif
 
   // ── Publish restore event if this boot follows a power outage ────────────
   // Check NVS for a saved outage start timestamp. If found, mains were lost
@@ -604,21 +877,35 @@ void setup() {
       "{\"sn\":\"SIM7-0001\",\"event\":\"restore\",\"outage_s\":0,"
       "\"adc\":%d,\"fw\":\"%s\",\"note\":\"boot\"}",
       bootAdc, FW_VERSION_STR);
-    Serial.println("[POWER] Published boot-restore event.");
-    mqtt->publish(MQTT_POWER_TOPIC, payload, true);
+    strlcpy(bootEventPayload, payload, sizeof(bootEventPayload));
+    bootEventPending = true;
+    Serial.println("[POWER] Boot-restore event queued for first MQTT connect.");
   }
 }
 
 // ─── Loop ─────────────────────────────────────────────────────────────────────
 void loop() {
-  if (!mqtt->connected()) connectMQTT();
-  mqtt->loop();
+  if (connectMQTT()) {
+    mqtt->loop();
+    if (bootEventPending &&
+        mqtt->publish(MQTT_POWER_TOPIC, bootEventPayload, true)) {
+      bootEventPending = false;
+      Serial.println("[POWER] Published boot-restore event.");
+    }
+  }
   otaLoop();
   checkPower();  // ADC poll + debounce — publishes on mains state change
 
+  // ── Hologram SMS downlink poll ────────────────────────────────────────────
+  if (usingCellular && (millis() - lastSmsPoll >= SMS_POLL_INTERVAL_MS)) {
+    lastSmsPoll = millis();
+    checkSMS();
+  }
+
   unsigned long now = millis();
-  if (now - lastPublish < PUBLISH_INTERVAL) return;
-  lastPublish = now;
+  // Read the sensor once a minute (local only — no data used).
+  if (lastSample != 0 && now - lastSample < SENSOR_SAMPLE_MS) return;
+  lastSample = now;
 
   // ── Read sensor ──────────────────────────────────────────────────────────
 #ifdef STUB_TEMP
@@ -653,8 +940,29 @@ void loop() {
 #  endif
 #endif
 
-  // ── Daily hi/lo ──────────────────────────────────────────────────────────
+  // ── Record temp for trend calculation (used in ESP-NOW callback) ─────────
+  recordTempSample(tempF);
+
+  // ── Daily hi/lo (every sample → more accurate hi/lo) ──────────────────────
   checkDailySummary(tempF);
+
+  // ── Decide whether to publish ────────────────────────────────────────────
+#ifdef USE_IMPERIAL
+  float bandF = tempF;
+#else
+  float bandF = tempF * 9.0f / 5.0f + 32.0f;   // thresholds are in °F
+#endif
+  uint8_t band        = calcColdBand(bandF, lastColdBand);
+  bool    bandChanged = (band != lastColdBand);
+  unsigned long interval = band ? min(COLD_PUBLISH_INTERVAL, PUBLISH_INTERVAL)
+                                : PUBLISH_INTERVAL;
+  // First status goes out right after boot.
+  if (lastPublish != 0 && !bandChanged && now - lastPublish < interval) return;
+  if (bandChanged)
+    Serial.printf("[TEMP] Cold band %u → %u at %.1f°F — publishing now\n",
+                  lastColdBand, band, bandF);
+  lastColdBand = band;
+  lastPublish  = now;
 
   // ── Realtime status payload ───────────────────────────────────────────────
   char payload[240];
@@ -662,24 +970,24 @@ void loop() {
   if (hasRH)
     snprintf(payload, sizeof(payload),
       "{\"sn\":\"SIM7-0001\",\"mode\":\"realtime\","
-      "\"temp_f\":%.1f,\"rh\":%.1f,\"mains\":\"%s\",\"fw\":\"%s\"}",
-      tempF, rh, mainsPresent ? "on" : "off", FW_VERSION_STR);
+      "\"temp_f\":%.1f,\"rh\":%.1f,\"mains\":\"%s\",\"fw\":\"%s\",\"reconn\":%lu}",
+      tempF, rh, mainsPresent ? "on" : "off", FW_VERSION_STR, (unsigned long)mqttReconnects);
   else
     snprintf(payload, sizeof(payload),
       "{\"sn\":\"SIM7-0001\",\"mode\":\"realtime\","
-      "\"temp_f\":%.1f,\"rh\":null,\"mains\":\"%s\",\"fw\":\"%s\"}",
-      tempF, mainsPresent ? "on" : "off", FW_VERSION_STR);
+      "\"temp_f\":%.1f,\"rh\":null,\"mains\":\"%s\",\"fw\":\"%s\",\"reconn\":%lu}",
+      tempF, mainsPresent ? "on" : "off", FW_VERSION_STR, (unsigned long)mqttReconnects);
 #else
   if (hasRH)
     snprintf(payload, sizeof(payload),
       "{\"sn\":\"SIM7-0001\",\"mode\":\"realtime\","
-      "\"temp_c\":%.1f,\"rh\":%.1f,\"mains\":\"%s\",\"fw\":\"%s\"}",
-      tempF, rh, mainsPresent ? "on" : "off", FW_VERSION_STR);
+      "\"temp_c\":%.1f,\"rh\":%.1f,\"mains\":\"%s\",\"fw\":\"%s\",\"reconn\":%lu}",
+      tempF, rh, mainsPresent ? "on" : "off", FW_VERSION_STR, (unsigned long)mqttReconnects);
   else
     snprintf(payload, sizeof(payload),
       "{\"sn\":\"SIM7-0001\",\"mode\":\"realtime\","
-      "\"temp_c\":%.1f,\"rh\":null,\"mains\":\"%s\",\"fw\":\"%s\"}",
-      tempF, mainsPresent ? "on" : "off", FW_VERSION_STR);
+      "\"temp_c\":%.1f,\"rh\":null,\"mains\":\"%s\",\"fw\":\"%s\",\"reconn\":%lu}",
+      tempF, mainsPresent ? "on" : "off", FW_VERSION_STR, (unsigned long)mqttReconnects);
 #endif
 
   Serial.printf("[%s] %s\n", usingCellular ? "CELL" : "WiFi", payload);

@@ -3,12 +3,13 @@
 // ============================================================
 //  OTA Update Module — LilyGO T-SIM7000G
 //
-//  Checks a version.json file on GitHub (raw.githubusercontent.com,
-//  no redirect) and downloads + flashes the new firmware binary
-//  from GitHub Releases if a newer version is available.
+//  Supports PRIVATE GitHub repos via PAT auth header.
+//  Checks sensor-version.json on raw.githubusercontent.com,
+//  then downloads the binary from the GitHub Releases API.
+//  Auth header is sent only to GitHub/githubusercontent hosts;
+//  S3/CDN redirect targets skip it (they use signed URLs).
 //
-//  Used on the WiFi path only — SIM7000G does not expose
-//  TinyGsmClientSecure, so HTTPS OTA is not available over cellular.
+//  Works over WiFi (WiFiClientSecure) and cellular (SSLClient).
 //
 //  Required lib (add to platformio.ini lib_deps):
 //    arduino-libraries/ArduinoHttpClient @ ^0.6.1
@@ -28,20 +29,22 @@
   #define OTA_GITHUB_HOST  "raw.githubusercontent.com"
 #endif
 
-// OTA_GITHUB_USER and OTA_GITHUB_REPO must be defined in main.cpp
-// (or as -D flags) before this header is included.
+// OTA_GITHUB_USER, OTA_GITHUB_REPO, OTA_GITHUB_TOKEN must be
+// defined in main.cpp or as -D build flags.
 #ifndef OTA_GITHUB_USER
-  #error "OTA_GITHUB_USER is not defined. Set it in main.cpp or platformio.ini."
+  #error "OTA_GITHUB_USER is not defined."
 #endif
 #ifndef OTA_GITHUB_REPO
-  #error "OTA_GITHUB_REPO is not defined. Set it in main.cpp or platformio.ini."
+  #error "OTA_GITHUB_REPO is not defined."
+#endif
+#ifndef OTA_GITHUB_TOKEN
+  #error "OTA_GITHUB_TOKEN is not defined — required for private repo OTA."
 #endif
 
-// Path to the version manifest on the default branch.
-// GitHub Actions keeps this file current after every release.
+// sensor-version.json is updated by GitHub Actions on each sensor release tag.
 #ifndef OTA_VERSION_PATH
   #define OTA_VERSION_PATH \
-    "/" OTA_GITHUB_USER "/" OTA_GITHUB_REPO "/main/version.json"
+    "/" OTA_GITHUB_USER "/" OTA_GITHUB_REPO "/main/sensor-version.json"
 #endif
 
 // How often to check for updates (seconds). Default: once per hour.
